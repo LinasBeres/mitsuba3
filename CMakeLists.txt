@@ -292,6 +292,13 @@ include_directories(include
   ${CMAKE_CURRENT_BINARY_DIR}/include
 )
 
+add_definitions(${NANOGUI_EXTRA_DEFS})
+
+include_directories(include
+  ${NANOGUI_EXTRA_INCS}
+  ${CMAKE_CURRENT_BINARY_DIR}/include
+)
+
 if (MI_ENABLE_CUDA)
   message(STATUS "Mitsuba: using OptiX for GPU ray tracing.")
   add_definitions(-DMI_ENABLE_CUDA=1)
@@ -527,6 +534,7 @@ endif()
 
 # Set up location for build products
 set_target_properties(mitsuba-bin mitsuba ${MI_DEPEND}
+  viewer-bin mitsuba ${MI_DEPEND}
   PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${MI_BINARY_DIR}
   LIBRARY_OUTPUT_DIRECTORY ${MI_BINARY_DIR}
@@ -542,6 +550,7 @@ set_target_properties(mitsuba-bin mitsuba ${MI_DEPEND}
 
 install(
   TARGETS mitsuba-bin mitsuba ${MI_DEPEND}
+  TARGETS viewer-bin mitsuba ${MI_DEPEND}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

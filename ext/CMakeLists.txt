@@ -280,6 +280,20 @@ mark_as_advanced(
 )
 
 # ----------------------------------------------------------
+#  nanogui
+# ----------------------------------------------------------
+# Disable building extras we won't need (pure C++ project)
+set(NANOGUI_BUILD_EXAMPLE OFF CACHE BOOL " " FORCE)
+set(NANOGUI_BUILD_PYTHON  OFF CACHE BOOL " " FORCE)
+set(NANOGUI_INSTALL       OFF CACHE BOOL " " FORCE)
+
+# Add the configurations from nanogui
+add_subdirectory(nanogui)
+
+# For reliability of parallel build, make the NanoGUI targets dependencies
+set_property(TARGET glfw glfw_objects nanogui PROPERTY FOLDER "dependencies")
+
+# ----------------------------------------------------------
 #  pugixml XML parser
 # ----------------------------------------------------------
 
@@ -339,6 +353,7 @@ set_target_properties(rgb2spec rgb2spec_opt rgb2spec_opt_run PROPERTIES FOLDER "
 
 add_subdirectory(fastfloat EXCLUDE_FROM_ALL)
 mark_as_advanced(
+
   FASTFLOAT_SANITIZE
   FASTFLOAT_TEST
 )
