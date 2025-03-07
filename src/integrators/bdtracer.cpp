@@ -149,16 +149,102 @@ public:
         // if (max_depth == 0)
             // return 0;
 
+        Spectrum throughput           = 1.f;
+        Spectrum result               = 0.f;
+        Float eta                     = 1.f;
+
+        // If m_hide_emitters == false, the environment emitter will be visible
+        Mask valid_ray = !m_hide_emitters && (scene->environment() != nullptr);
+
+        // Variables caching information from the previous bounce
+        Interaction3f prev_si         = dr::zeros<Interaction3f>();
+        Float         prev_bsdf_pdf   = 1.f;
+        Bool          prev_bsdf_delta = true;
+        BSDFContext   bsdf_ctx;
+
         Bool active = true;
 
         int bounces = 0;
 
         LightPath &lpath = path[bounces];
 
+        struct LoopState {
+            Ray3f ray;
+            Spectrum throughput;
+            Spectrum result;
+            Float eta;
+            int depth;
+            Mask valid_ray;
+            Interaction3f prev_si;
+            Float prev_bsdf_pdf;
+            Bool prev_bsdf_delta;
+            Bool active;
+            Sampler* sampler;
+
+            DRJIT_STRUCT(LoopState, ray, throughput, result, eta, depth, \
+                valid_ray, prev_si, prev_bsdf_pdf, prev_bsdf_delta,
+                active, sampler)
+        } ls = {
+            ray,
+            throughput,
+            result,
+            eta,
+            depth,
+            valid_ray,
+            prev_si,
+            prev_bsdf_pdf,
+            prev_bsdf_delta,
+            active,
+            sampler
+        };
+
+        while(true) {
+            SurfaceInteraction3f si =
+                scene->ray_intersect(ls.ray,
+                                     /* ray_flags = */ +RayFlags::All,
+                                     /* coherent = */ ls.depth == 0u);
+            // ---------------------- Direct emission ----------------------
+
+            /* dr::any_or() checks for active entries in the provided boolean
+               array. JIT/Megakernel modes can't do this test efficiently as
+               each Monte Carlo sample runs independently. In this case,
+               dr::any_or<..>() returns the template argument (true) which means
+               that the 'if' statement is always conservatively taken. */
+            if (dr::any_or<true>(si.emitter(scene) != nullptr)) {
+                DirectionSample3f ds(scene, si, ls.prev_si);
+                Float em_pdf = 0.f;
+
+                if (dr::any_or<true>(!ls.prev_bsdf_delta))
+                    em_pdf = scene->pdf_emitter_direction(ls.prev_si, ds,
+                                                          !ls.prev_bsdf_delta);
+
+                // Compute MIS weight for emitter sample from previous bounce
+                Float mis_bsdf = mis_weight(ls.prev_bsdf_pdf, em_pdf);
+
+                // Accumulate, being careful with polarization (see spec_fma)
+                ls.result = spec_fma(
+                    ls.throughput,
+                    ds.emitter->eval(si, ls.prev_bsdf_pdf > 0.f) * mis_bsdf,
+                    ls.result);
+            }
+
+            // Continue tracing the path at this point?
+            Bool active_next = (ls.depth + 1 < m_max_depth) && si.is_valid();
+
+            // if (dr::none_or<false>(active_next)) {
+                // ls.active = active_next;
+                // return; // early exit for scalar mode
+            // }
+
+            BSDFPtr bsdf = si.bsdf(ls.ray);
+
+            break;
+        }
+
 
         SurfaceInteraction3f si = scene->ray_intersect(
             ray, +RayFlags::All, /* coherent = */ true, active);
-        Mask valid_ray = active && si.is_valid();
+        valid_ray = valid_ray && si.is_valid();
 
         lpath.si = si;
         lpath.beta = 0.f;
