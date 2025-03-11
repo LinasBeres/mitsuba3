@@ -214,7 +214,7 @@ public:
                     dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
 
                 // Accumulate, being careful with polarization (see spec_fma)
-                lpath.L[active_em] = spec_fma(
+                prev_lpath.L[active_em] = spec_fma(
                     prev_lpath.beta, bsdf_val * em_weight * mis_em, prev_lpath.L);
             }
 
@@ -225,6 +225,7 @@ public:
             ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
 
             // ------ Update loop variables based on current interaction ------
+            lpath.L = prev_lpath.L;
             lpath.si = si;
             lpath.beta = prev_lpath.beta * bsdf_weight;
             lpath.pdf_fwd = bsdf_sample.pdf;
