@@ -1,4 +1,5 @@
 #include "mitsuba/core/spectrum.h"
+#include <iterator>
 #include <mitsuba/core/ray.h>
 #include <mitsuba/core/properties.h>
 #include <mitsuba/render/bsdf.h>
@@ -17,16 +18,17 @@ public:
     enum class PathType { Camera, Light, Surface };
 
     struct LightPath {
-        SurfaceInteraction3f si;
+        SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
         Spectrum beta = 0.f;
         Spectrum L = 0.f;
 
         Float pdf_fwd = 0.f;
         Float pdf_rev = 0.f;
 
-        Bool delta;
+        Bool delta = false;
 
-        // LightPath(const SurfaceInteraction3f &si, Spectrum s) : si(si), beta(s) {}
+        LightPath() = default;
+        LightPath(const SurfaceInteraction3f &si, Spectrum s) : si(si), beta(s) {}
 
         const Point3f &p() const { return si.p; }
 
@@ -53,13 +55,13 @@ public:
         }
 
 
-        static LightPath create_light(const SurfaceInteraction3f& si, Spectrum beta, float pdf) {
-            LightPath lpath;
-            lpath.si = si;
-            lpath.beta = beta;
-            lpath.pdf_fwd = pdf;
-            return lpath;
-        }
+        // static LightPath create_light(const SurfaceInteraction3f& si, Spectrum beta, float pdf) {
+            // LightPath lpath;
+            // lpath.si = si;
+            // lpath.beta = beta;
+            // lpath.pdf_fwd = pdf;
+            // return lpath;
+        // }
 
 
     };
@@ -91,6 +93,7 @@ public:
 
         int n_sensor = generate_sensor_subpath(scene, sampler, ray, m_max_depth, sensor_paths);
 
+        // std::cerr << "N: " << n_sensor << " max depth: " << m_max_depth << "\n";
         LightPath p = sensor_paths[n_sensor];
 
         Mask valid_ray = active && p.si.is_valid();
@@ -113,12 +116,10 @@ public:
         if (max_depth == 0)
             return 0;
 
-        LightPath &lpath = path[0];
         Spectrum beta(1.f);
-        SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
-        lpath.si = si;
+
+        LightPath &lpath = path[0];
         lpath.beta = beta;
-        lpath.L = 0.f;
         lpath.pdf_fwd = 1.f;
         lpath.delta = true;
 
@@ -138,22 +139,30 @@ public:
 
         // Initial Variables
         Ray3f ray = ray_;
-        Bool active = true;
         int bounces = 0;
         BSDFContext bsdf_ctx(transport_mode);
 
-        // If m_hide_emitters == false, the environment emitter will be visible
-        Mask valid_ray = !m_hide_emitters && (scene->environment() != nullptr);
+        while(true)
+        {
+            LightPath &prev_lpath = path[bounces];
 
-        LightPath &prev_lpath = path[bounces];
-
-        while(true) {
-            // if (dr::any(dr::max(unpolarized_spectrum(beta)) != 0.f))
-                // break;
             SurfaceInteraction3f si =
                 scene->ray_intersect(ray,
                                      /* ray_flags = */ +RayFlags::All,
                                      /* coherent = */  bounces == 0u);
+
+            // Escape if we cannot go any further
+            Bool active_next = (bounces + 1 < max_depth) && si.is_valid();
+            if (dr::none_or<false>(active_next)) {
+                break;
+            }
+
+            // --------------------- Prep Current Path ---------------------
+            // Prepare current light path
+            LightPath &lpath = path[++bounces];
+            lpath.L = prev_lpath.L;
+            lpath.beta = prev_lpath.beta;
+            lpath.si = si;
 
             // ---------------------- Direct emission ----------------------
             // Did we hit a light?
@@ -166,21 +175,15 @@ public:
 
                 Float mis_bsdf = mis_weight(prev_lpath.pdf_fwd, em_pdf);
 
-                prev_lpath.L = spec_fma(prev_lpath.beta, ds.emitter->eval(si, prev_lpath.pdf_fwd > 0.f) * mis_bsdf, prev_lpath.L);
+                lpath.L = spec_fma(prev_lpath.beta,
+                        ds.emitter->eval(si, prev_lpath.pdf_fwd > 0.f) * mis_bsdf, lpath.L);
             }
-
-            Bool active_next = (bounces + 1 < max_depth) && si.is_valid();
-
-            if (dr::none_or<false>(active_next)) {
-                break; // early exit for scalar mode
-            }
-
 
             BSDFPtr bsdf = si.bsdf(ray);
 
             // ---------------------- Emitter sampling ----------------------
             // Perform emitter sampling?
-            Mask active_em = active_next && has_flag(bsdf->flags(), BSDFFlags::Smooth);
+            Mask active_em = has_flag(bsdf->flags(), BSDFFlags::Smooth);
 
             DirectionSample3f ds = dr::zeros<DirectionSample3f>();
             Spectrum em_weight = dr::zeros<Spectrum>();
@@ -204,8 +207,6 @@ public:
                 = bsdf->eval_pdf_sample(bsdf_ctx, si, wo, sample_1, sample_2);
 
             // --------------- Emitter sampling contribution ----------------
-            LightPath &lpath = path[bounces + 1];
-            lpath.L = 0.f;
             if (dr::any_or<true>(active_em)) {
                 bsdf_val = si.to_world_mueller(bsdf_val, -wo, si.wi);
 
@@ -214,34 +215,24 @@ public:
                     dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
 
                 // Accumulate, being careful with polarization (see spec_fma)
-                prev_lpath.L[active_em] = spec_fma(
-                    prev_lpath.beta, bsdf_val * em_weight * mis_em, prev_lpath.L);
+                lpath.L[active_em] = spec_fma(
+                    prev_lpath.beta, bsdf_val * em_weight * mis_em, lpath.L);
             }
 
             // ---------------------- BSDF sampling ----------------------
 
             bsdf_weight = si.to_world_mueller(bsdf_weight, -bsdf_sample.wo, si.wi);
 
-            ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
 
-            // ------ Update loop variables based on current interaction ------
-            lpath.L = prev_lpath.L;
-            lpath.si = si;
-            lpath.beta = prev_lpath.beta * bsdf_weight;
+            // Update BSDF values;
+            lpath.beta *= bsdf_weight;
             lpath.pdf_fwd = bsdf_sample.pdf;
             lpath.delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
-            valid_ray |= active && si.is_valid() &&
-                         !has_flag(bsdf_sample.sampled_type, BSDFFlags::Null);
 
-            prev_lpath = lpath;
-            if (dr::any(si.is_valid()))
-                bounces += 1;
+            ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
         }
-
         return bounces;
     }
-
-
 
 
     //! @}
