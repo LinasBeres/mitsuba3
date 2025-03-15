@@ -1,4 +1,5 @@
 #include "mitsuba/core/spectrum.h"
+#include <cstdlib>
 #include <iterator>
 #include <mitsuba/core/ray.h>
 #include <mitsuba/core/properties.h>
@@ -26,6 +27,12 @@ public:
         Float pdf_rev = 0.f;
 
         Bool delta = false;
+        Bool is_camera = false;
+        Bool is_light = false;
+
+        BSDFPtr bsdf = nullptr;
+
+        EmitterPtr emitter = nullptr;
 
         LightPath() = default;
         LightPath(const SurfaceInteraction3f &si, Spectrum s) : si(si), beta(s) {}
@@ -35,8 +42,6 @@ public:
         const Normal3f &n() const { return si.n; }
 
         Mask on_surface() const { return si.shape != nullptr; }
-
-        bool is_light(Scene *scene) const { return dr::any_or<true>(si.emitter(scene) != nullptr); }
 
         bool is_infinite_light() const { return false; }
 
@@ -54,14 +59,25 @@ public:
             return 0.f;
         }
 
+        static LightPath create_sensor() {
+            LightPath lpath = LightPath();
+            lpath.delta = true;
+            lpath.pdf_fwd = 1.f;
+            lpath.is_camera = true;
+            lpath.beta = 1.f;
 
-        // static LightPath create_light(const SurfaceInteraction3f& si, Spectrum beta, float pdf) {
-            // LightPath lpath;
-            // lpath.si = si;
-            // lpath.beta = beta;
-            // lpath.pdf_fwd = pdf;
-            // return lpath;
-        // }
+            return lpath;
+        }
+
+
+        static LightPath create_light(const EmitterPtr &emitter, Spectrum beta) {
+            LightPath lpath = LightPath();
+            lpath.beta = beta;
+            lpath.is_light = true;
+            lpath.emitter = emitter;
+
+            return lpath;
+        }
 
 
     };
@@ -79,7 +95,6 @@ public:
         if (unlikely(m_max_depth == 0))
             return { 0.f, false };
 
-        // --------------------- Configure loop state ----------------------
 
         Ray3f ray                     = Ray3f(ray_);
         Spectrum result               = 0.f;
@@ -87,25 +102,72 @@ public:
         std::vector<LightPath> sensor_paths(m_max_depth);
         std::vector<LightPath> emitter_paths(m_max_depth + 1);
 
-        // SurfaceInteraction3f si = scene->ray_intersect(
-            // ray, +RayFlags::All, [> coherent = <] true, active);
-        // Mask valid_ray = active && si.is_valid();
 
         int n_sensor = generate_sensor_subpath(scene, sampler, ray, m_max_depth, sensor_paths);
+        int n_emitter = generate_emitter_subpath(scene, sampler, m_max_depth+1, emitter_paths);
 
-        // std::cerr << "N: " << n_sensor << " max depth: " << m_max_depth << "\n";
+
         LightPath p = sensor_paths[n_sensor];
 
-        Mask valid_ray = active && p.si.is_valid();
-        if (dr::none_or<false>(active))
-            return { result, valid_ray };
+        // join camera path to light path
+        LightPath light = emitter_paths[0];
+        LightPath hit = emitter_paths[1];
 
-        result = p.L;
+        for (int t = 1; t <= n_sensor; ++t) {
+            LightPath prev = sensor_paths[t-1];
+            LightPath lpath = sensor_paths[t];
+
+            DirectionSample3f ds = dr::zeros<DirectionSample3f>();
+            Spectrum em_weight = dr::zeros<Spectrum>();
+            Vector3f wo = dr::zeros<Vector3f>();
+
+            Mask active_em = has_flag(lpath.bsdf->flags(), BSDFFlags::Smooth);
+
+            if (dr::any_or<true>(active_em)) {
+                // Sample the emitter
+                std::tie(ds, em_weight) = scene->sample_emitter_direction(
+                    lpath.si, sampler->next_2d(), true, active_em);
+                active_em &= (ds.pdf != 0.f);
+
+                wo = lpath.si.to_local(ds.d);
+            }
+
+
+            BSDFContext bsdf_ctx;
+            auto [bsdf_val, bsdf_pdf] = lpath.bsdf->eval_pdf(bsdf_ctx, lpath.si, wo);
+            if (dr::any_or<true>(active_em)) {
+                bsdf_val = lpath.si.to_world_mueller(bsdf_val, -wo, lpath.si.wi);
+
+                // Compute the MIS weight
+                Float mis_em =
+                    dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
+
+                // Accumulate, being careful with polarization (see spec_fma)
+                result[active_em] = spec_fma(
+                    prev.beta, bsdf_val * em_weight * mis_em, result);
+            }
+
+        }
+
+
+        Mask valid_ray = true;
 
         return {
             /* spec  = */ dr::select(valid_ray, result, 0.f),
             /* valid = */ valid_ray
         };
+    }
+
+
+    Spectrum connect_paths(const Scene *scene,
+                                Sampler *sampler,
+                                std::vector<LightPath> &sensor_paths,
+                                std::vector<LightPath> &emitter_paths,
+                                int s, int e) const {
+
+        Spectrum result = 0.f;
+
+
     }
 
     int generate_sensor_subpath(const Scene *scene,
@@ -116,14 +178,30 @@ public:
         if (max_depth == 0)
             return 0;
 
-        Spectrum beta(1.f);
+        path[0] = LightPath::create_sensor();
 
-        LightPath &lpath = path[0];
-        lpath.beta = beta;
-        lpath.pdf_fwd = 1.f;
-        lpath.delta = true;
+        return random_walk(scene, sampler, ray, 1.f, max_depth, path, TransportMode::Radiance);
+    }
 
-        return random_walk(scene, sampler, ray, beta, max_depth, path, TransportMode::Radiance);
+    int generate_emitter_subpath(const Scene *scene,
+                                    Sampler *sampler,
+                                    int max_depth,
+                                    std::vector<LightPath> &path) const {
+        if (max_depth == 0)
+            return 0;
+
+        // Prepare random samples.
+        Float wavelength_sample = sampler->next_1d();
+        Point2f direction_sample = sampler->next_2d(),
+                position_sample  = sampler->next_2d();
+
+        // Sample one ray from an emitter in the scene.
+        auto [ray, ray_weight, emitter] = scene->sample_emitter_ray(
+            0.f, wavelength_sample, direction_sample, position_sample);
+
+        path[0] = LightPath::create_light(emitter, ray_weight);
+
+        return random_walk(scene, sampler, ray, 1.f, max_depth, path, TransportMode::Importance);
     }
 
     int random_walk(const Scene *scene,
@@ -166,7 +244,7 @@ public:
 
             // ---------------------- Direct emission ----------------------
             // Did we hit a light?
-            if (dr::any_or<true>(si.emitter(scene) != nullptr)) {
+            if (false && dr::any_or<true>(si.emitter(scene) != nullptr) && transport_mode != TransportMode::Importance) {
                 DirectionSample3f ds(scene, si, prev_lpath.si);
                 Float em_pdf = 0.f;
 
@@ -179,52 +257,18 @@ public:
                         ds.emitter->eval(si, prev_lpath.pdf_fwd > 0.f) * mis_bsdf, lpath.L);
             }
 
+            // ---------------------- BSDF sampling ----------------------
             BSDFPtr bsdf = si.bsdf(ray);
-
-            // ---------------------- Emitter sampling ----------------------
-            // Perform emitter sampling?
-            Mask active_em = has_flag(bsdf->flags(), BSDFFlags::Smooth);
-
-            DirectionSample3f ds = dr::zeros<DirectionSample3f>();
-            Spectrum em_weight = dr::zeros<Spectrum>();
-            Vector3f wo = dr::zeros<Vector3f>();
-
-            if (dr::any_or<true>(active_em)) {
-                // Sample the emitter
-                std::tie(ds, em_weight) = scene->sample_emitter_direction(
-                    si, sampler->next_2d(), true, active_em);
-                active_em &= (ds.pdf != 0.f);
-
-                wo = si.to_local(ds.d);
-            }
-
-            // ------ Evaluate BSDF * cos(theta) and sample direction -------
 
             Float sample_1 = sampler->next_1d();
             Point2f sample_2 = sampler->next_2d();
 
-            auto [bsdf_val, bsdf_pdf, bsdf_sample, bsdf_weight]
-                = bsdf->eval_pdf_sample(bsdf_ctx, si, wo, sample_1, sample_2);
-
-            // --------------- Emitter sampling contribution ----------------
-            if (dr::any_or<true>(active_em)) {
-                bsdf_val = si.to_world_mueller(bsdf_val, -wo, si.wi);
-
-                // Compute the MIS weight
-                Float mis_em =
-                    dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
-
-                // Accumulate, being careful with polarization (see spec_fma)
-                lpath.L[active_em] = spec_fma(
-                    prev_lpath.beta, bsdf_val * em_weight * mis_em, lpath.L);
-            }
-
-            // ---------------------- BSDF sampling ----------------------
+            auto [bsdf_sample, bsdf_weight] = bsdf->sample(bsdf_ctx, si, sample_1, sample_2);
 
             bsdf_weight = si.to_world_mueller(bsdf_weight, -bsdf_sample.wo, si.wi);
 
-
             // Update BSDF values;
+            lpath.bsdf = bsdf;
             lpath.beta *= bsdf_weight;
             lpath.pdf_fwd = bsdf_sample.pdf;
             lpath.delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
