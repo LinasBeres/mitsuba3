@@ -21,7 +21,6 @@ public:
     struct LightPath {
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
         Spectrum beta = 0.f;
-        Spectrum L = 0.f;
 
         Float pdf_fwd = 0.f;
         Float pdf_rev = 0.f;
@@ -102,20 +101,54 @@ public:
         std::vector<LightPath> sensor_paths(m_max_depth);
         std::vector<LightPath> emitter_paths(m_max_depth + 1);
 
-
         int n_sensor = generate_sensor_subpath(scene, sampler, ray, m_max_depth, sensor_paths);
         int n_emitter = generate_emitter_subpath(scene, sampler, m_max_depth+1, emitter_paths);
 
+        for (int s = 1; s <= n_sensor; ++s) {
+            for (int e = 0; e <= 1; ++e) {
+                result += connect_paths(scene, sampler, sensor_paths, emitter_paths, s, e);
+            }
+        }
 
-        LightPath p = sensor_paths[n_sensor];
+        Mask valid_ray = true;
 
-        // join camera path to light path
-        LightPath light = emitter_paths[0];
-        LightPath hit = emitter_paths[1];
+        return {
+            /* spec  = */ dr::select(valid_ray, result, 0.f),
+            /* valid = */ valid_ray
+        };
+    }
 
-        for (int t = 1; t <= n_sensor; ++t) {
-            LightPath prev = sensor_paths[t-1];
-            LightPath lpath = sensor_paths[t];
+
+    Spectrum connect_paths(const Scene *scene,
+                                Sampler *sampler,
+                                const std::vector<LightPath> &sensor_paths,
+                                const std::vector<LightPath> &emitter_paths,
+                                int s, int e) const {
+
+        Spectrum result = 0.f;
+
+        if (e == 0) {
+            // Interpret the sensor subpath as a complete path, i.e. direct emission.
+            LightPath prev_lpath = sensor_paths[s - 1]; // get throughput from previous hit
+            LightPath lpath = sensor_paths[s]; // current hit bsdf.
+
+            if (dr::any_or<true>(lpath.si.emitter(scene) != nullptr)) {
+                DirectionSample3f ds(scene, lpath.si, prev_lpath.si);
+                Float em_pdf = 0.f;
+
+                if (dr::any_or<true>(!prev_lpath.delta))
+                    em_pdf = scene->pdf_emitter_direction(prev_lpath.si, ds, !prev_lpath.delta);
+
+                Float mis_bsdf = mis_weight(prev_lpath.pdf_fwd, em_pdf);
+
+                result = prev_lpath.beta * ds.emitter->eval(lpath.si, prev_lpath.pdf_fwd > 0.f) * mis_bsdf;
+            }
+
+
+        } else if (e == 1) {
+            // Sample a point on a emitter and connect it to the sensor subpath.
+            LightPath prev_lpath = sensor_paths[s - 1]; // get throughput from previous hit
+            LightPath lpath = sensor_paths[s]; // current hit bsdf.
 
             DirectionSample3f ds = dr::zeros<DirectionSample3f>();
             Spectrum em_weight = dr::zeros<Spectrum>();
@@ -130,12 +163,9 @@ public:
                 active_em &= (ds.pdf != 0.f);
 
                 wo = lpath.si.to_local(ds.d);
-            }
+                BSDFContext bsdf_ctx;
+                auto [bsdf_val, bsdf_pdf] = lpath.bsdf->eval_pdf(bsdf_ctx, lpath.si, wo);
 
-
-            BSDFContext bsdf_ctx;
-            auto [bsdf_val, bsdf_pdf] = lpath.bsdf->eval_pdf(bsdf_ctx, lpath.si, wo);
-            if (dr::any_or<true>(active_em)) {
                 bsdf_val = lpath.si.to_world_mueller(bsdf_val, -wo, lpath.si.wi);
 
                 // Compute the MIS weight
@@ -143,31 +173,11 @@ public:
                     dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
 
                 // Accumulate, being careful with polarization (see spec_fma)
-                result[active_em] = spec_fma(
-                    prev.beta, bsdf_val * em_weight * mis_em, result);
+                result[active_em] = prev_lpath.beta * bsdf_val * em_weight * mis_em;
             }
-
         }
 
-
-        Mask valid_ray = true;
-
-        return {
-            /* spec  = */ dr::select(valid_ray, result, 0.f),
-            /* valid = */ valid_ray
-        };
-    }
-
-
-    Spectrum connect_paths(const Scene *scene,
-                                Sampler *sampler,
-                                std::vector<LightPath> &sensor_paths,
-                                std::vector<LightPath> &emitter_paths,
-                                int s, int e) const {
-
-        Spectrum result = 0.f;
-
-
+        return result;
     }
 
     int generate_sensor_subpath(const Scene *scene,
@@ -235,28 +245,6 @@ public:
                 break;
             }
 
-            // --------------------- Prep Current Path ---------------------
-            // Prepare current light path
-            LightPath &lpath = path[++bounces];
-            lpath.L = prev_lpath.L;
-            lpath.beta = prev_lpath.beta;
-            lpath.si = si;
-
-            // ---------------------- Direct emission ----------------------
-            // Did we hit a light?
-            if (false && dr::any_or<true>(si.emitter(scene) != nullptr) && transport_mode != TransportMode::Importance) {
-                DirectionSample3f ds(scene, si, prev_lpath.si);
-                Float em_pdf = 0.f;
-
-                if (dr::any_or<true>(!prev_lpath.delta))
-                    em_pdf = scene->pdf_emitter_direction(prev_lpath.si, ds, !prev_lpath.delta);
-
-                Float mis_bsdf = mis_weight(prev_lpath.pdf_fwd, em_pdf);
-
-                lpath.L = spec_fma(prev_lpath.beta,
-                        ds.emitter->eval(si, prev_lpath.pdf_fwd > 0.f) * mis_bsdf, lpath.L);
-            }
-
             // ---------------------- BSDF sampling ----------------------
             BSDFPtr bsdf = si.bsdf(ray);
 
@@ -267,9 +255,27 @@ public:
 
             bsdf_weight = si.to_world_mueller(bsdf_weight, -bsdf_sample.wo, si.wi);
 
-            // Update BSDF values;
+            // --------------------- Prep Current Path ---------------------
+            // Update path values;
+            LightPath &lpath = path[++bounces];
+
+            lpath.beta = prev_lpath.beta * bsdf_weight;
+            if (transport_mode == TransportMode::Importance) {
+                // Using geometric normals (wo points to the camera)
+                Float wi_dot_geo_n = dr::dot(si.n, -ray.d),
+                      wo_dot_geo_n = dr::dot(si.n, si.to_world(bsdf_sample.wo));
+
+                // Prevent light leaks due to shading normals
+                Mask active = (wi_dot_geo_n * Frame3f::cos_theta(si.wi) > 0.f) &&
+                             (wo_dot_geo_n * Frame3f::cos_theta(bsdf_sample.wo) > 0.f);
+
+                // Adjoint BSDF for shading normals -- [Veach, p. 155]
+                Float correction = dr::abs((Frame3f::cos_theta(si.wi) * wo_dot_geo_n) /
+                                           (Frame3f::cos_theta(bsdf_sample.wo) * wi_dot_geo_n));
+                lpath.beta *= correction;
+            }
+            lpath.si = si;
             lpath.bsdf = bsdf;
-            lpath.beta *= bsdf_weight;
             lpath.pdf_fwd = bsdf_sample.pdf;
             lpath.delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
 
