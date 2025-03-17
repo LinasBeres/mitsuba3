@@ -104,11 +104,16 @@ public:
         int n_sensor = generate_sensor_subpath(scene, sampler, ray, m_max_depth, sensor_paths);
         int n_emitter = generate_emitter_subpath(scene, sampler, m_max_depth+1, emitter_paths);
 
+        // if (n_sensor >= 1 && n_emitter >= 5)
+            // result += connect_paths(scene, sampler, sensor_paths, emitter_paths, 1, 5);
+
         for (int s = 1; s <= n_sensor; ++s) {
-            for (int e = 0; e <= 1; ++e) {
+            for (int e = 0; e <= n_emitter; ++e) {
                 result += connect_paths(scene, sampler, sensor_paths, emitter_paths, s, e);
             }
         }
+
+        result = result / (n_sensor * n_emitter);
 
         Mask valid_ray = true;
 
@@ -143,7 +148,7 @@ public:
 
                 result = prev_lpath.beta * ds.emitter->eval(lpath.si, prev_lpath.pdf_fwd > 0.f) * mis_bsdf;
             }
-
+        }  else if (s == 0) {
 
         } else if (e == 1) {
             // Sample a point on a emitter and connect it to the sensor subpath.
@@ -152,7 +157,6 @@ public:
 
             DirectionSample3f ds = dr::zeros<DirectionSample3f>();
             Spectrum em_weight = dr::zeros<Spectrum>();
-            Vector3f wo = dr::zeros<Vector3f>();
 
             Mask active_em = has_flag(lpath.bsdf->flags(), BSDFFlags::Smooth);
 
@@ -162,7 +166,7 @@ public:
                     lpath.si, sampler->next_2d(), true, active_em);
                 active_em &= (ds.pdf != 0.f);
 
-                wo = lpath.si.to_local(ds.d);
+                Vector3f wo = lpath.si.to_local(ds.d);
                 BSDFContext bsdf_ctx;
                 auto [bsdf_val, bsdf_pdf] = lpath.bsdf->eval_pdf(bsdf_ctx, lpath.si, wo);
 
@@ -172,9 +176,35 @@ public:
                 Float mis_em =
                     dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
 
-                // Accumulate, being careful with polarization (see spec_fma)
                 result[active_em] = prev_lpath.beta * bsdf_val * em_weight * mis_em;
             }
+        } else {
+            // First check if connectible...
+            Spectrum radiance_throughput  = sensor_paths[s - 1].beta;
+            Spectrum importance_throughput = emitter_paths[e - 1].beta;
+            LightPath lpath = sensor_paths[s];
+            LightPath epath = emitter_paths[e];
+
+            Mask active_em = has_flag(lpath.bsdf->flags(), BSDFFlags::Smooth) && has_flag(epath.bsdf->flags(), BSDFFlags::Smooth);
+
+            Mask occluded = scene->ray_test(lpath.si.spawn_ray_to(epath.si.p), active_em);
+            if (dr::none(occluded)) {
+                Vector3f d = dr::normalize(epath.si.p - lpath.si.p);
+                Vector3f wo = lpath.si.to_local(d);
+
+                BSDFContext bsdf_ctx;
+                auto [sensor_bsdf_val, sensor_bsdf_pdf] = lpath.bsdf->eval_pdf(bsdf_ctx, lpath.si, wo);
+
+                Vector3f wi = epath.si.to_local(-d);
+
+                bsdf_ctx = BSDFContext(TransportMode::Importance);
+                auto [emitter_bsdf_val, emitter_bsdf_pdf] = epath.bsdf->eval_pdf(bsdf_ctx, epath.si, wi);
+
+                Float mis_bsdf = mis_weight(sensor_bsdf_pdf, emitter_bsdf_pdf);
+
+                result = radiance_throughput * sensor_bsdf_val * importance_throughput * emitter_bsdf_val * mis_bsdf;
+            }
+
         }
 
         return result;
@@ -265,6 +295,7 @@ public:
                 Float wi_dot_geo_n = dr::dot(si.n, -ray.d),
                       wo_dot_geo_n = dr::dot(si.n, si.to_world(bsdf_sample.wo));
 
+                // TODO.
                 // Prevent light leaks due to shading normals
                 Mask active = (wi_dot_geo_n * Frame3f::cos_theta(si.wi) > 0.f) &&
                              (wo_dot_geo_n * Frame3f::cos_theta(bsdf_sample.wo) > 0.f);
