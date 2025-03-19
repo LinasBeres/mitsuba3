@@ -18,9 +18,9 @@ public:
 
     enum class PathType { Camera, Light, Surface };
 
-    struct LightPath {
+    struct Vertex {
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
-        Spectrum beta = 0.f;
+        Spectrum throughput = 0.f;
 
         Float pdf_fwd = 0.f;
         Float pdf_rev = 0.f;
@@ -33,8 +33,8 @@ public:
 
         EmitterPtr emitter = nullptr;
 
-        LightPath() = default;
-        LightPath(const SurfaceInteraction3f &si, Spectrum s) : si(si), beta(s) {}
+        Vertex() = default;
+        Vertex(const SurfaceInteraction3f &si, Spectrum s) : si(si), throughput(s) {}
 
         const Point3f &p() const { return si.p; }
 
@@ -48,7 +48,7 @@ public:
 
         bool is_connectable() const { return true; }
 
-        Spectrum f(const LightPath &next) const {
+        Spectrum f(const Vertex &next) const {
             Vector3f wo = dr::normalize(next.p() - p());
             BSDFContext ctx;
             return si.bsdf()->eval(ctx, si, wo);
@@ -58,24 +58,24 @@ public:
             return 0.f;
         }
 
-        static LightPath create_sensor() {
-            LightPath lpath = LightPath();
-            lpath.delta = true;
-            lpath.pdf_fwd = 1.f;
-            lpath.is_camera = true;
-            lpath.beta = 1.f;
+        static Vertex create_sensor() {
+            Vertex vertex = Vertex();
+            vertex.delta = true;
+            vertex.pdf_fwd = 1.f;
+            vertex.is_camera = true;
+            vertex.throughput = 1.f;
 
-            return lpath;
+            return vertex;
         }
 
 
-        static LightPath create_light(const EmitterPtr &emitter, Spectrum beta) {
-            LightPath lpath = LightPath();
-            lpath.beta = beta;
-            lpath.is_light = true;
-            lpath.emitter = emitter;
+        static Vertex create_light(const EmitterPtr &emitter, Spectrum throughput) {
+            Vertex vertex = Vertex();
+            vertex.throughput = throughput;
+            vertex.is_light = true;
+            vertex.emitter = emitter;
 
-            return lpath;
+            return vertex;
         }
 
 
@@ -98,22 +98,39 @@ public:
         Ray3f ray                     = Ray3f(ray_);
         Spectrum result               = 0.f;
 
-        std::vector<LightPath> sensor_paths(m_max_depth);
-        std::vector<LightPath> emitter_paths(m_max_depth + 1);
+        std::vector<Vertex> sensor_paths(m_max_depth);
+        std::vector<Vertex> emitter_paths(m_max_depth);
 
         int n_sensor = generate_sensor_subpath(scene, sampler, ray, m_max_depth, sensor_paths);
-        int n_emitter = generate_emitter_subpath(scene, sampler, m_max_depth+1, emitter_paths);
+        int n_emitter = generate_emitter_subpath(scene, sampler, m_max_depth, emitter_paths);
 
-        // if (n_sensor >= 1 && n_emitter >= 5)
-            // result += connect_paths(scene, sampler, sensor_paths, emitter_paths, 1, 5);
+        // if (n_sensor >= 1 && n_emitter >= 2)
+            // result += connect_paths(scene, sampler, sensor_paths, emitter_paths, 1, 2);
 
-        for (int s = 1; s <= n_sensor; ++s) {
+        int a = 0;
+        for (int s = 0; s <= n_sensor; ++s) {
             for (int e = 0; e <= n_emitter; ++e) {
-                result += connect_paths(scene, sampler, sensor_paths, emitter_paths, s, e);
+                int depth = s + e;
+                if ((s == 0 && e == 0) || depth <= 0 || depth > m_max_depth)
+                    continue;
+                Spectrum L = connect_paths(scene, sampler, sensor_paths, emitter_paths, s, e);
+
+                Float result_max = dr::max(unpolarized_spectrum(L));
+                if (dr::any(result_max == 0.f)) {
+                    continue;
+                }
+
+                // TODO: we're at sensor so splat L.
+                if (s == 0) {
+                } else {
+                    result += L;
+                    ++a;
+                }
+
             }
         }
 
-        result = result / (n_sensor * n_emitter);
+        result = result / (a ? a : 1);
 
         Mask valid_ray = true;
 
@@ -126,83 +143,89 @@ public:
 
     Spectrum connect_paths(const Scene *scene,
                                 Sampler *sampler,
-                                const std::vector<LightPath> &sensor_paths,
-                                const std::vector<LightPath> &emitter_paths,
+                                const std::vector<Vertex> &sensor_paths,
+                                const std::vector<Vertex> &emitter_paths,
                                 int s, int e) const {
 
         Spectrum result = 0.f;
 
         if (e == 0) {
             // Interpret the sensor subpath as a complete path, i.e. direct emission.
-            LightPath prev_lpath = sensor_paths[s - 1]; // get throughput from previous hit
-            LightPath lpath = sensor_paths[s]; // current hit bsdf.
+            Vertex prev_vertex = sensor_paths[s - 1]; // get throughput from previous hit
+            Vertex vertex = sensor_paths[s]; // current hit bsdf.
 
-            if (dr::any_or<true>(lpath.si.emitter(scene) != nullptr)) {
-                DirectionSample3f ds(scene, lpath.si, prev_lpath.si);
+            if (dr::any_or<true>(vertex.si.emitter(scene) != nullptr)) {
+                DirectionSample3f ds(scene, vertex.si, prev_vertex.si);
                 Float em_pdf = 0.f;
 
-                if (dr::any_or<true>(!prev_lpath.delta))
-                    em_pdf = scene->pdf_emitter_direction(prev_lpath.si, ds, !prev_lpath.delta);
+                if (dr::any_or<true>(!prev_vertex.delta))
+                    em_pdf = scene->pdf_emitter_direction(prev_vertex.si, ds, !prev_vertex.delta);
 
-                Float mis_bsdf = mis_weight(prev_lpath.pdf_fwd, em_pdf);
+                Float mis_bsdf = mis_weight(prev_vertex.pdf_fwd, em_pdf);
 
-                result = prev_lpath.beta * ds.emitter->eval(lpath.si, prev_lpath.pdf_fwd > 0.f) * mis_bsdf;
+                result = vertex.throughput * ds.emitter->eval(vertex.si, prev_vertex.pdf_fwd > 0.f) * mis_bsdf;
             }
         }  else if (s == 0) {
 
         } else if (e == 1) {
             // Sample a point on a emitter and connect it to the sensor subpath.
-            LightPath prev_lpath = sensor_paths[s - 1]; // get throughput from previous hit
-            LightPath lpath = sensor_paths[s]; // current hit bsdf.
+            Vertex vertex = sensor_paths[s]; // current hit bsdf.
 
             DirectionSample3f ds = dr::zeros<DirectionSample3f>();
             Spectrum em_weight = dr::zeros<Spectrum>();
 
-            Mask active_em = has_flag(lpath.bsdf->flags(), BSDFFlags::Smooth);
+            Mask active_em = has_flag(vertex.bsdf->flags(), BSDFFlags::Smooth);
 
             if (dr::any_or<true>(active_em)) {
                 // Sample the emitter
                 std::tie(ds, em_weight) = scene->sample_emitter_direction(
-                    lpath.si, sampler->next_2d(), true, active_em);
+                    vertex.si, sampler->next_2d(), true, active_em);
                 active_em &= (ds.pdf != 0.f);
 
-                Vector3f wo = lpath.si.to_local(ds.d);
+                Vector3f wo = vertex.si.to_local(ds.d);
                 BSDFContext bsdf_ctx;
-                auto [bsdf_val, bsdf_pdf] = lpath.bsdf->eval_pdf(bsdf_ctx, lpath.si, wo);
+                auto [bsdf_val, bsdf_pdf] = vertex.bsdf->eval_pdf(bsdf_ctx, vertex.si, wo);
 
-                bsdf_val = lpath.si.to_world_mueller(bsdf_val, -wo, lpath.si.wi);
+                bsdf_val = vertex.si.to_world_mueller(bsdf_val, -wo, vertex.si.wi);
 
                 // Compute the MIS weight
                 Float mis_em =
                     dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
 
-                result[active_em] = prev_lpath.beta * bsdf_val * em_weight * mis_em;
+                result[active_em] = vertex.throughput * bsdf_val * em_weight * mis_em;
             }
         } else {
             // First check if connectible...
-            Spectrum radiance_throughput  = sensor_paths[s - 1].beta;
-            Spectrum importance_throughput = emitter_paths[e - 1].beta;
-            LightPath lpath = sensor_paths[s];
-            LightPath epath = emitter_paths[e];
+            Vertex s_vertex = sensor_paths[s];
+            Vertex e_vertex = emitter_paths[e];
 
-            Mask active_em = has_flag(lpath.bsdf->flags(), BSDFFlags::Smooth) && has_flag(epath.bsdf->flags(), BSDFFlags::Smooth);
+            Mask active = has_flag(s_vertex.bsdf->flags(), BSDFFlags::Smooth) && has_flag(e_vertex.bsdf->flags(), BSDFFlags::Smooth);
+            if (dr::none(active))
+                return result;
 
-            Mask occluded = scene->ray_test(lpath.si.spawn_ray_to(epath.si.p), active_em);
+            Mask occluded = scene->ray_test(s_vertex.si.spawn_ray_to(e_vertex.si.p), active);
             if (dr::none(occluded)) {
-                Vector3f d = dr::normalize(epath.si.p - lpath.si.p);
-                Vector3f wo = lpath.si.to_local(d);
+                // Perp direction.
+                Vector3f d     = e_vertex.si.p - s_vertex.si.p;
+                Float dist     = dr::norm(d);
+                Float inv_dist = dr::rcp(dist);
+                d             *= inv_dist;
 
+                // Eval sensor vertex bsdf
+                Vector3f wo = s_vertex.si.to_local(d);
                 BSDFContext bsdf_ctx;
-                auto [sensor_bsdf_val, sensor_bsdf_pdf] = lpath.bsdf->eval_pdf(bsdf_ctx, lpath.si, wo);
+                auto [sensor_bsdf_val, sensor_bsdf_pdf] = s_vertex.bsdf->eval_pdf(bsdf_ctx, s_vertex.si, wo);
 
-                Vector3f wi = epath.si.to_local(-d);
-
+                // Eval emitter vertex bsdf
+                Vector3f wi = e_vertex.si.to_local(-d);
                 bsdf_ctx = BSDFContext(TransportMode::Importance);
-                auto [emitter_bsdf_val, emitter_bsdf_pdf] = epath.bsdf->eval_pdf(bsdf_ctx, epath.si, wi);
+                auto [emitter_bsdf_val, emitter_bsdf_pdf] = e_vertex.bsdf->eval_pdf(bsdf_ctx, e_vertex.si, wi);
 
                 Float mis_bsdf = mis_weight(sensor_bsdf_pdf, emitter_bsdf_pdf);
 
-                result = radiance_throughput * sensor_bsdf_val * importance_throughput * emitter_bsdf_val * mis_bsdf;
+                result = s_vertex.throughput * sensor_bsdf_val *
+                         e_vertex.throughput * emitter_bsdf_val *
+                         mis_bsdf * dr::square(inv_dist);
             }
 
         }
@@ -214,19 +237,19 @@ public:
                                    Sampler *sampler,
                                    const Ray3f &ray,
                                    int max_depth,
-                                   std::vector<LightPath> &path) const {
+                                   std::vector<Vertex> &path) const {
         if (max_depth == 0)
             return 0;
 
-        path[0] = LightPath::create_sensor();
+        path[0] = Vertex::create_sensor();
 
-        return random_walk(scene, sampler, ray, 1.f, max_depth, path, TransportMode::Radiance);
+        return random_walk(scene, sampler, ray, /* throughput: */ 1.f, max_depth, path, TransportMode::Radiance);
     }
 
     int generate_emitter_subpath(const Scene *scene,
                                     Sampler *sampler,
                                     int max_depth,
-                                    std::vector<LightPath> &path) const {
+                                    std::vector<Vertex> &path) const {
         if (max_depth == 0)
             return 0;
 
@@ -239,30 +262,33 @@ public:
         auto [ray, ray_weight, emitter] = scene->sample_emitter_ray(
             0.f, wavelength_sample, direction_sample, position_sample);
 
-        path[0] = LightPath::create_light(emitter, ray_weight);
+        path[0] = Vertex::create_light(emitter, ray_weight);
 
-        return random_walk(scene, sampler, ray, 1.f, max_depth, path, TransportMode::Importance);
+        return random_walk(scene, sampler, ray, ray_weight, max_depth, path, TransportMode::Importance);
     }
 
     int random_walk(const Scene *scene,
                        Sampler *sampler,
                        const Ray3f &ray_,
-                       Spectrum,
+                       Spectrum throughput,
                        int max_depth,
-                       std::vector<LightPath> &path,
+                       std::vector<Vertex> &path,
                        TransportMode transport_mode) const
     {
         if (max_depth == 0)
             return 0;
 
         // Initial Variables
+        Mask active = true;
         Ray3f ray = ray_;
         int bounces = 0;
         BSDFContext bsdf_ctx(transport_mode);
 
         while(true)
         {
-            LightPath &prev_lpath = path[bounces];
+            // -------------------- Stopping criterion ---------------------
+            Float throughput_max = dr::max(unpolarized_spectrum(throughput));
+            active &= (throughput_max != 0.f);
 
             SurfaceInteraction3f si =
                 scene->ray_intersect(ray,
@@ -270,7 +296,7 @@ public:
                                      /* coherent = */  bounces == 0u);
 
             // Escape if we cannot go any further
-            Bool active_next = (bounces + 1 < max_depth) && si.is_valid();
+            Bool active_next = active && (bounces + 1 < max_depth) && si.is_valid();
             if (dr::none_or<false>(active_next)) {
                 break;
             }
@@ -285,33 +311,37 @@ public:
 
             bsdf_weight = si.to_world_mueller(bsdf_weight, -bsdf_sample.wo, si.wi);
 
-            // --------------------- Prep Current Path ---------------------
-            // Update path values;
-            LightPath &lpath = path[++bounces];
-
-            lpath.beta = prev_lpath.beta * bsdf_weight;
+            // --------------------- Particle Tracing ---------------------
+            Float correction = 1.f;
             if (transport_mode == TransportMode::Importance) {
                 // Using geometric normals (wo points to the camera)
                 Float wi_dot_geo_n = dr::dot(si.n, -ray.d),
                       wo_dot_geo_n = dr::dot(si.n, si.to_world(bsdf_sample.wo));
 
-                // TODO.
                 // Prevent light leaks due to shading normals
-                Mask active = (wi_dot_geo_n * Frame3f::cos_theta(si.wi) > 0.f) &&
-                             (wo_dot_geo_n * Frame3f::cos_theta(bsdf_sample.wo) > 0.f);
+                active &= (wi_dot_geo_n * Frame3f::cos_theta(si.wi) > 0.f) &&
+                          (wo_dot_geo_n * Frame3f::cos_theta(bsdf_sample.wo) > 0.f);
 
                 // Adjoint BSDF for shading normals -- [Veach, p. 155]
-                Float correction = dr::abs((Frame3f::cos_theta(si.wi) * wo_dot_geo_n) /
+                correction = dr::abs((Frame3f::cos_theta(si.wi) * wo_dot_geo_n) /
                                            (Frame3f::cos_theta(bsdf_sample.wo) * wi_dot_geo_n));
-                lpath.beta *= correction;
             }
-            lpath.si = si;
-            lpath.bsdf = bsdf;
-            lpath.pdf_fwd = bsdf_sample.pdf;
-            lpath.delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
+            if (dr::none_or<false>(active))
+                break;
 
+            // ------------------- Update Current Hit --------------------
+            Vertex &vertex= path[++bounces];
+            vertex.throughput = throughput;
+            vertex.si = si;
+            vertex.bsdf = bsdf;
+            vertex.pdf_fwd = bsdf_sample.pdf;
+            vertex.delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
+
+            // ----------------------- Prepare Ray -----------------------
+            throughput *= bsdf_weight * correction;
             ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
         }
+
         return bounces;
     }
 
