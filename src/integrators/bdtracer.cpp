@@ -101,8 +101,8 @@ public:
         std::vector<Vertex> sensor_paths(m_max_depth);
         std::vector<Vertex> emitter_paths(m_max_depth);
 
-        int n_sensor = generate_sensor_subpath(scene, sampler, ray, m_max_depth, sensor_paths);
-        int n_emitter = generate_emitter_subpath(scene, sampler, m_max_depth, emitter_paths);
+        int n_sensor = generate_sensor_subpath(scene, sampler, ray, m_max_depth, sensor_paths, active);
+        int n_emitter = generate_emitter_subpath(scene, sampler, m_max_depth, emitter_paths, active);
 
         // if (n_sensor >= 1 && n_emitter >= 2)
             // result += connect_paths(scene, sampler, sensor_paths, emitter_paths, 1, 2);
@@ -237,20 +237,22 @@ public:
                                    Sampler *sampler,
                                    const Ray3f &ray,
                                    int max_depth,
-                                   std::vector<Vertex> &path) const {
-        if (max_depth == 0)
+                                   std::vector<Vertex> &path,
+                                   Bool active) const {
+        if (unlikely(max_depth == 0))
             return 0;
 
         path[0] = Vertex::create_sensor();
 
-        return random_walk(scene, sampler, ray, /* throughput: */ 1.f, max_depth, path, TransportMode::Radiance);
+        return random_walk(scene, sampler, ray, /* throughput: */ 1.f, max_depth, path, TransportMode::Radiance, active);
     }
 
     int generate_emitter_subpath(const Scene *scene,
                                     Sampler *sampler,
                                     int max_depth,
-                                    std::vector<Vertex> &path) const {
-        if (max_depth == 0)
+                                    std::vector<Vertex> &path,
+                                    Bool active) const {
+        if (unlikely(max_depth == 0))
             return 0;
 
         // Prepare random samples.
@@ -264,7 +266,7 @@ public:
 
         path[0] = Vertex::create_light(emitter, ray_weight);
 
-        return random_walk(scene, sampler, ray, ray_weight, max_depth, path, TransportMode::Importance);
+        return random_walk(scene, sampler, ray, ray_weight, max_depth, path, TransportMode::Importance, active);
     }
 
     int random_walk(const Scene *scene,
@@ -273,39 +275,57 @@ public:
                        Spectrum throughput,
                        int max_depth,
                        std::vector<Vertex> &path,
-                       TransportMode transport_mode) const
+                       TransportMode transport_mode,
+                       Bool active) const
     {
-        if (max_depth == 0)
+        if (unlikely(max_depth == 0))
             return 0;
 
         // Initial Variables
-        Mask active = true;
-        Ray3f ray = ray_;
-        int bounces = 0;
         BSDFContext bsdf_ctx(transport_mode);
 
-        while(true)
-        {
+        struct LoopState {
+            Ray3f ray;
+            Spectrum throughput;
+            int bounces;
+            Bool active;
+            Sampler* sampler;
+
+            DRJIT_STRUCT(LoopState, ray, throughput, bounces, \
+                    active, sampler)
+        } ls = {
+            ray_,
+            throughput,
+            /* bounces: */ 0,
+            active,
+            sampler
+        };
+
+        dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
+            [](const LoopState& ls) { return ls.active; },
+            [scene, bsdf_ctx, max_depth, transport_mode, &path](LoopState& ls) {
+
             // -------------------- Stopping criterion ---------------------
-            Float throughput_max = dr::max(unpolarized_spectrum(throughput));
-            active &= (throughput_max != 0.f);
+            Float throughput_max = dr::max(unpolarized_spectrum(ls.throughput));
+            ls.active &= (throughput_max != 0.f);
 
             SurfaceInteraction3f si =
-                scene->ray_intersect(ray,
+                scene->ray_intersect(ls.ray,
                                      /* ray_flags = */ +RayFlags::All,
-                                     /* coherent = */  bounces == 0u);
+                                     /* coherent = */  ls.bounces == 0u);
 
             // Escape if we cannot go any further
-            Bool active_next = active && (bounces + 1 < max_depth) && si.is_valid();
+            Bool active_next = ls.active && (ls.bounces + 1 < max_depth) && si.is_valid();
             if (dr::none_or<false>(active_next)) {
-                break;
+                ls.active = active_next;
+                return;
             }
 
             // ---------------------- BSDF sampling ----------------------
-            BSDFPtr bsdf = si.bsdf(ray);
+            BSDFPtr bsdf = si.bsdf(ls.ray);
 
-            Float sample_1 = sampler->next_1d();
-            Point2f sample_2 = sampler->next_2d();
+            Float sample_1 = ls.sampler->next_1d();
+            Point2f sample_2 = ls.sampler->next_2d();
 
             auto [bsdf_sample, bsdf_weight] = bsdf->sample(bsdf_ctx, si, sample_1, sample_2);
 
@@ -315,34 +335,34 @@ public:
             Float correction = 1.f;
             if (transport_mode == TransportMode::Importance) {
                 // Using geometric normals (wo points to the camera)
-                Float wi_dot_geo_n = dr::dot(si.n, -ray.d),
+                Float wi_dot_geo_n = dr::dot(si.n, -ls.ray.d),
                       wo_dot_geo_n = dr::dot(si.n, si.to_world(bsdf_sample.wo));
 
                 // Prevent light leaks due to shading normals
-                active &= (wi_dot_geo_n * Frame3f::cos_theta(si.wi) > 0.f) &&
+                ls.active &= (wi_dot_geo_n * Frame3f::cos_theta(si.wi) > 0.f) &&
                           (wo_dot_geo_n * Frame3f::cos_theta(bsdf_sample.wo) > 0.f);
 
                 // Adjoint BSDF for shading normals -- [Veach, p. 155]
                 correction = dr::abs((Frame3f::cos_theta(si.wi) * wo_dot_geo_n) /
                                            (Frame3f::cos_theta(bsdf_sample.wo) * wi_dot_geo_n));
             }
-            if (dr::none_or<false>(active))
-                break;
+            if (dr::none_or<false>(ls.active))
+                return;
 
             // ------------------- Update Current Hit --------------------
-            Vertex &vertex= path[++bounces];
-            vertex.throughput = throughput;
+            Vertex &vertex = path[++ls.bounces];
+            vertex.throughput = ls.throughput;
             vertex.si = si;
             vertex.bsdf = bsdf;
             vertex.pdf_fwd = bsdf_sample.pdf;
             vertex.delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
 
             // ----------------------- Prepare Ray -----------------------
-            throughput *= bsdf_weight * correction;
-            ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
-        }
+            ls.throughput *= bsdf_weight * correction;
+            ls.ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
+        });
 
-        return bounces;
+        return ls.bounces;
     }
 
 
