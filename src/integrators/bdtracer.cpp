@@ -17,38 +17,14 @@ public:
                    m_hide_emitters)
     MI_IMPORT_TYPES(Scene, Sampler, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr)
 
-    enum class PathType { Camera, Light, Surface };
-
     struct Vertex {
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
+        Spectrum throughput     = 0.f;
+        Float bsdf_pdf          = 0.f;
+        Bool delta              = false;
+        BSDFPtr bsdf            = nullptr;
 
-        Spectrum throughput = 0.f;
-
-        Float pdf_fwd = 0.f;
-
-        Bool delta = false;
-
-        BSDFPtr bsdf = nullptr;
-
-        Vertex() = default;
-        Vertex(const SurfaceInteraction3f &si, Spectrum s)
-            : si(si), throughput(s) {}
-
-        static Vertex create_sensor() {
-            Vertex vertex     = Vertex();
-            vertex.delta      = true;
-            vertex.pdf_fwd    = 1.f;
-            vertex.throughput = 1.f;
-
-            return vertex;
-        }
-
-        static Vertex create_light(Spectrum throughput) {
-            Vertex vertex     = Vertex();
-            vertex.throughput = throughput;
-
-            return vertex;
-        }
+        DRJIT_STRUCT(Vertex, si, throughput, bsdf_pdf, delta, bsdf)
     };
 
     BiDirectionalTracer(const Properties &props) : Base(props) {}
@@ -66,10 +42,10 @@ public:
         std::vector<Vertex> sensor_paths(m_max_depth);
         std::vector<Vertex> emitter_paths(m_max_depth);
 
-        int n_sensor = generate_sensor_subpath(
-            scene, sampler, ray_, m_max_depth, sensor_paths, active);
-        int n_emitter = generate_emitter_subpath(scene, sampler, m_max_depth,
-                                                 emitter_paths, active);
+        int n_sensor =
+            generate_sensor_subpath(scene, sampler, ray_, sensor_paths, active);
+        int n_emitter =
+            generate_emitter_subpath(scene, sampler, emitter_paths, active);
 
         int a           = 0;
         Spectrum result = 0.f;
@@ -126,15 +102,15 @@ public:
                     em_pdf = scene->pdf_emitter_direction(prev_vertex.si, ds,
                                                           !prev_vertex.delta);
 
-                Float mis_bsdf = mis_weight(prev_vertex.pdf_fwd, em_pdf);
+                Float mis_bsdf = mis_weight(prev_vertex.bsdf_pdf, em_pdf);
 
                 result =
                     vertex.throughput *
-                    ds.emitter->eval(vertex.si, prev_vertex.pdf_fwd > 0.f) *
+                    ds.emitter->eval(vertex.si, prev_vertex.bsdf_pdf > 0.f) *
                     mis_bsdf;
             }
         } else if (s == 0) {
-
+            // TODO
         } else if (e == 1) {
             // Sample a point on a emitter and connect it to the sensor subpath.
             Vertex vertex = sensor_paths[s]; // current hit bsdf.
@@ -208,23 +184,18 @@ public:
     }
 
     int generate_sensor_subpath(const Scene *scene, Sampler *sampler,
-                                const Ray3f &ray, int max_depth,
-                                std::vector<Vertex> &path, Bool active) const {
-        if (unlikely(max_depth == 0))
-            return 0;
-
-        path[0] = Vertex::create_sensor();
+                                const Ray3f &ray, std::vector<Vertex> &path,
+                                Bool active) const {
+        path[0].throughput = 1.f;
+        path[0].bsdf_pdf   = 1.f;
+        path[0].delta      = true;
 
         return random_walk(scene, sampler, ray, /* throughput: */ 1.f,
-                           max_depth, path, TransportMode::Radiance, active);
+                           m_max_depth, path, TransportMode::Radiance, active);
     }
 
     int generate_emitter_subpath(const Scene *scene, Sampler *sampler,
-                                 int max_depth, std::vector<Vertex> &path,
-                                 Bool active) const {
-        if (unlikely(max_depth == 0))
-            return 0;
-
+                                 std::vector<Vertex> &path, Bool active) const {
         // Prepare random samples.
         Float wavelength_sample  = sampler->next_1d();
         Point2f direction_sample = sampler->next_2d(),
@@ -234,9 +205,9 @@ public:
         auto [ray, ray_weight, emitter] = scene->sample_emitter_ray(
             0.f, wavelength_sample, direction_sample, position_sample);
 
-        path[0] = Vertex::create_light(ray_weight);
+        path[0].throughput = ray_weight;
 
-        return random_walk(scene, sampler, ray, ray_weight, max_depth, path,
+        return random_walk(scene, sampler, ray, ray_weight, m_max_depth, path,
                            TransportMode::Importance, active);
     }
 
@@ -321,7 +292,7 @@ public:
                 vertex.throughput = ls.throughput;
                 vertex.si         = si;
                 vertex.bsdf       = bsdf;
-                vertex.pdf_fwd    = bsdf_sample.pdf;
+                vertex.bsdf_pdf   = bsdf_sample.pdf;
                 vertex.delta =
                     has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
 
