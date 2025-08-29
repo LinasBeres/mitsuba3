@@ -338,6 +338,5 @@ public:
     MI_DECLARE_CLASS()
 };
 
-MI_IMPLEMENT_CLASS_VARIANT(BiDirectionalTracer, MonteCarloIntegrator)
-MI_EXPORT_PLUGIN(BiDirectionalTracer, "Bi-Directional Tracer integrator");
+MI_EXPORT_PLUGIN(BiDirectionalTracer);
 NAMESPACE_END(mitsuba)
