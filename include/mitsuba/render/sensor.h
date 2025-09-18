@@ -87,6 +87,30 @@ public:
     sample_wavelengths(const SurfaceInteraction3f &si, Float sample,
                        Mask active = true) const override;
 
+    /**
+     * \brief Evaluate the ray connection between a scene point and a specific UV
+     * coordinate on the sensor's film.
+     *
+     * This function computes the importance weight of a ray from a given scene
+     * interaction point `it` to a specific UV coordinate `uv` on the sensor film.
+     *
+     * \param it
+     *     A scene interaction point.
+     *
+     * \param uv
+     *     The 2D coordinate on the sensor film plane to which the ray is being
+     *     connected.
+     *
+     * \param active
+     *     A mask for active lanes.
+     *
+     * \return
+     *     A pair containing a `DirectionSample3f` and a `Spectrum`
+     *     representing the importance weight of the connection.
+     */
+    virtual std::pair<DirectionSample3f, Spectrum>
+    eval_uv(const Interaction3f &it, const Point2f &uv, Mask active) const;
+
     //! @}
     // =============================================================
 
@@ -323,6 +347,7 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Sensor)
     DRJIT_CALL_METHOD(sample_direction)
     DRJIT_CALL_METHOD(pdf_direction)
     DRJIT_CALL_METHOD(eval_direction)
+    DRJIT_CALL_METHOD(eval_uv)
     DRJIT_CALL_METHOD(sample_position)
     DRJIT_CALL_METHOD(pdf_position)
     DRJIT_CALL_METHOD(eval)

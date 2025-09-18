@@ -9,6 +9,8 @@
 #include <nanobind/stl/vector.h>
 #include <drjit/python.h>
 
+static const char *__doc_mitsuba_Sensor_eval_uv = R"doc()doc";
+
 /// Trampoline for derived types implemented in Python
 MI_VARIANT class PySensor : public Sensor<Float, Spectrum> {
 public:
@@ -49,6 +51,12 @@ public:
                             const DirectionSample3f &ds,
                             Mask active)  const override {
         NB_OVERRIDE_PURE(eval_direction, ref, ds, active);
+    }
+
+    std::pair<DirectionSample3f, Spectrum>
+    eval_uv(const Interaction3f &it, const Point2f &uv, Mask active) const override {
+        using Return = std::pair<DirectionSample3f, Spectrum>;
+        NB_OVERRIDE_PURE(eval_uv, it, uv, active);
     }
 
     std::pair<PositionSample3f, Float>
@@ -161,6 +169,12 @@ template <typename Ptr, typename Cls> void bind_sensor_generic(Cls &cls) {
                 return ptr->shape();
             },
             D(Endpoint, shape));
+    cls.def("eval_uv",
+        [](Ptr ptr, const Interaction3f &it, const Point2f &uv, Mask active) {
+            return ptr->eval_uv(it, uv, active);
+        },
+        "it"_a, "uv"_a, "active"_a = true,
+        D(Sensor, eval_uv));
 }
 
 MI_PY_EXPORT(Sensor) {

@@ -113,6 +113,13 @@ Sensor<Float, Spectrum>::sample_wavelengths(const SurfaceInteraction3f& /*si*/, 
     return sample_wavelength<Float, Spectrum>(sample);
 }
 
+MI_VARIANT std::pair<typename Sensor<Float, Spectrum>::DirectionSample3f, Spectrum>
+Sensor<Float, Spectrum>::eval_uv(const Interaction3f & /*it*/,
+                                 const Point2f & /*uv*/,
+                                 Mask /*active*/) const {
+    NotImplementedError("eval_uv");
+}
+
 // =============================================================================
 // ProjectiveCamera interface
 // =============================================================================

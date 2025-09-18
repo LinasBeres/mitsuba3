@@ -323,6 +323,63 @@ public:
         return { ds, Spectrum(importance(local_d) * inv_dist * inv_dist) };
     }
 
+    std::pair<DirectionSample3f, Spectrum>
+    eval_uv(const Interaction3f &it, const Point2f &uv, Mask active) const override {
+        // Transform the reference point into the local coordinate system
+        AffineTransform4f trafo = m_to_world.value();
+        Point3f ref_p = trafo.inverse() * it.p;
+
+        std::cerr << "testing testing 123\n";
+
+        DirectionSample3f ds = dr::zeros<DirectionSample3f>();
+        ds.uv = uv;
+
+        // Check if the scene point is within the camera's clip range
+        ds.pdf = 0.f;
+        active &= (ref_p.z() >= m_near_clip) && (ref_p.z() <= m_far_clip);
+
+        // If active, compute the ray properties
+        if (dr::any(active)) {
+            Vector3f local_d = dr::normalize(Vector3f(ref_p));
+            Float dist = dr::norm(ref_p);
+            Float inv_dist = dr::rcp(dist);
+
+            // Project the scene point onto the camera's sensor plane to get its UVs.
+            Vector2f scaled_principal_point_offset =
+                m_film->size() * m_principal_point_offset / m_film->crop_size();
+
+            Point3f screen_sample = m_sample_to_camera.inverse() * ref_p;
+            Point2f uv_on_film = Point2f(screen_sample.x() - scaled_principal_point_offset.x(),
+                                         screen_sample.y() - scaled_principal_point_offset.y());
+
+            // Check if the ray's UV projection matches the input UV
+            Float uv_x = uv.x() * m_film->size().x();
+            Float uv_y = uv.y() * m_film->size().y();
+
+            active &= dr::abs(uv_on_film.x() * m_resolution.x() - uv_x) < 1e-4f;
+            active &= dr::abs(uv_on_film.y() * m_resolution.y() - uv_y) < 1e-4f;
+
+            if (dr::none_or<false>(active))
+                return { ds, dr::zeros<Spectrum>() };
+
+            ds.p = trafo * Point3f(0.0f);
+            ds.d = (ds.p - it.p) * inv_dist;
+            ds.dist = dist;
+            ds.n = trafo * Vector3f(0.0f, 0.0f, 1.0f);
+
+            // Compute PDF based on the camera importance
+            Float pdf_value = importance(local_d);
+            ds.pdf = dr::select(active, pdf_value, Float(0.f));
+
+            // The importance weight for the connection
+            Spectrum importance_weight = Spectrum(ds.pdf * inv_dist * inv_dist);
+
+            return { ds, importance_weight };
+        }
+
+        return { ds, dr::zeros<Spectrum>() };
+    }
+
     ScalarBoundingBox3f bbox() const override {
         ScalarPoint3f p = m_to_world.scalar() * ScalarPoint3f(0.f);
         return ScalarBoundingBox3f(p, p);
