@@ -898,6 +898,12 @@ public:
     /// Return the area sensor associated with this shape (if any)
     Sensor *sensor(Mask /*unused*/ = true) { return m_sensor.get(); }
 
+    /// Is this shape a receiver surface that accumulates incident irradiance?
+    bool is_receiver() const { return m_is_receiver; }
+
+    /// Resolution of the UV lightmap allocated for this receiver (pixels per side)
+    uint32_t receiver_resolution() const { return m_receiver_resolution; }
+
     /**
      * \brief Returns the number of sub-primitives that make up this shape
      *
@@ -1049,6 +1055,8 @@ protected:
     ref<Medium> m_interior_medium;
     ref<Medium> m_exterior_medium;
     ShapeType m_shape_type = ShapeType::Invalid;
+    bool m_is_receiver = false;
+    uint32_t m_receiver_resolution = 256;
 
     uint32_t m_discontinuity_types = (uint32_t) DiscontinuityFlags::Empty;
     /// Sampling weight (proportional to scene)
@@ -1196,6 +1204,8 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Shape)
     DRJIT_CALL_GETTER(silhouette_sampling_weight)
     DRJIT_CALL_GETTER(has_flipped_normals)
     DRJIT_CALL_GETTER(shape_type)
+    DRJIT_CALL_GETTER(is_receiver)
+    DRJIT_CALL_GETTER(receiver_resolution)
     auto is_emitter() const { return emitter() != nullptr; }
     auto is_sensor() const { return sensor() != nullptr; }
     auto is_mesh() const { return (shape_type() & +mitsuba::ShapeType::Mesh) != 0; }

@@ -23,6 +23,9 @@ MI_VARIANT Shape<Float, Spectrum>::Shape(const Properties &props)
     m_to_world =
         (ScalarAffineTransform4f) props.get<ScalarAffineTransform4f>("to_world", ScalarAffineTransform4f());
 
+    m_is_receiver        = props.get<bool>("is_receiver", false);
+    m_receiver_resolution = (uint32_t) props.get<int>("receiver_resolution", 256);
+
     for (auto &prop : props.objects()) {
         if (Emitter *emitter = prop.try_get<Emitter>()) {
             if (m_emitter)

@@ -85,6 +85,8 @@ template <typename Ptr, typename Cls> void bind_shape_generic(Cls &cls) {
             D(Shape, is_emitter))
        .def("is_sensor", [](Ptr shape) { return shape->is_sensor(); },
             D(Shape, is_sensor))
+       .def("is_receiver", [](Ptr shape) { return shape->is_receiver(); })
+       .def("receiver_resolution", [](Ptr shape) { return shape->receiver_resolution(); })
        .def("is_mesh", [](Ptr shape) { return shape->is_mesh(); },
             D(Shape, is_mesh))
        .def("is_ellipsoids", [](Ptr shape) { return shape->is_ellipsoids(); },
