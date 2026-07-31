@@ -10,6 +10,7 @@
 #include <mitsuba/render/emitter.h>
 #include <mitsuba/render/records.h>
 #include <mitsuba/render/sampler.h>
+#include <mitsuba/render/mesh.h>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -28,7 +29,7 @@ public:
     MI_IMPORT_BASE(AdjointIntegrator, m_samples_per_pass, m_hide_emitters,
                     m_rr_depth, m_max_depth)
     MI_IMPORT_TYPES(Scene, Sensor, Film, Sampler, ImageBlock, Emitter,
-                     EmitterPtr, BSDF, BSDFPtr, Shape, ShapePtr)
+                     EmitterPtr, BSDF, BSDFPtr, Shape, ShapePtr, Mesh)
 
     // =========================================================
     // SurfaceReceiver
@@ -42,16 +43,36 @@ public:
             uint32_t width, height;
             ScalarFloat surface_area;    // world-space area of the shape, for lux normalization
             DynamicBuffer<Float> data;   // accumulated flux per pixel (before normalization)
+
+            // Planar-projection fallback for meshes without UV texture coordinates.
+            // uv_axis0/1 are the two world axes (0=X,1=Y,2=Z) that map to U and V.
+            // uv_origin and uv_inv_size convert world coordinates to [0,1].
+            bool         has_uv    = true;
+            int          uv_axis0  = 0;
+            int          uv_axis1  = 2;
+            ScalarFloat  uv_origin0 = 0.f, uv_origin1 = 0.f;
+            ScalarFloat  uv_inv_size0 = 1.f, uv_inv_size1 = 1.f;
         };
 
         std::vector<Lightmap> lightmaps;
 
         void prepare(const Scene *scene) {
             lightmaps.clear();
+            uint32_t first_res = 0;
             for (auto &shape : scene->shapes()) {
                 if (!shape->is_receiver())
                     continue;
                 uint32_t res = shape->receiver_resolution();
+                if (first_res == 0) {
+                    first_res = res;
+                } else if (res != first_res) {
+                    Log(Warn, "ltracer: receiver '%s' requests resolution %u but all "
+                              "receivers must share the same resolution for the atlas; "
+                              "overriding to %u. Add <integer name=\"receiver_resolution\" "
+                              "value=\"%u\"/> to this shape to silence this warning.",
+                        shape->id(), res, first_res, first_res);
+                    res = first_res;
+                }
                 Lightmap lm;
                 lm.shape        = shape.get();
                 lm.width        = res;
@@ -60,24 +81,69 @@ public:
                 dr::eval(area);
                 lm.surface_area = dr::slice<ScalarFloat>(area, 0u);
                 lm.data         = dr::zeros<DynamicBuffer<Float>>(res * res);
+
+                // Only Mesh subclasses carry per-vertex UV coordinates.
+                // Built-in shapes (sphere, rectangle, disk, etc.) never have them,
+                // so cast first and fall back to planar projection for everything else.
+                const Mesh *mesh = dynamic_cast<const Mesh *>(shape.get());
+                lm.has_uv = mesh && mesh->has_vertex_texcoords();
+                if (!lm.has_uv) {
+                    // Identify the surface's dominant normal axis by finding which
+                    // world axis has the smallest bounding-box extent — that axis is
+                    // perpendicular to the surface.  The other two become U and V.
+                    auto bb = shape->bbox();
+                    ScalarVector3f ext = bb.max - bb.min;
+                    int normal_axis = 0;
+                    if (ext[1] < ext[normal_axis]) normal_axis = 1;
+                    if (ext[2] < ext[normal_axis]) normal_axis = 2;
+                    lm.uv_axis0  = (normal_axis + 1) % 3;
+                    lm.uv_axis1  = (normal_axis + 2) % 3;
+                    lm.uv_origin0    = bb.min[lm.uv_axis0];
+                    lm.uv_origin1    = bb.min[lm.uv_axis1];
+                    lm.uv_inv_size0  = (ext[lm.uv_axis0] > 0) ? (1.f / ext[lm.uv_axis0]) : 1.f;
+                    lm.uv_inv_size1  = (ext[lm.uv_axis1] > 0) ? (1.f / ext[lm.uv_axis1]) : 1.f;
+                    Log(Warn, "ltracer: receiver '%s' has no UV coords — "
+                              "falling back to planar projection (axes %d, %d)",
+                        shape->id(), lm.uv_axis0, lm.uv_axis1);
+                }
+
                 lightmaps.push_back(std::move(lm));
             }
             Log(Info, "ltracer: prepared %zu receiver lightmap(s)", lightmaps.size());
         }
 
-        // Accumulates incoming irradiance as scalar lux (pre-BSDF).
+        // Returns the world-position component along axis 0, 1, or 2.
+        static Float world_component(const SurfaceInteraction3f &si, int axis) {
+            if (axis == 0) return si.p.x();
+            if (axis == 1) return si.p.y();
+            return si.p.z();
+        }
+
+        // Accumulates incoming flux as scalar lux.
         // luminance() handles all variants: Rec.709 weights for RGB,
-        // CIE 1931 Y integral for spectral. Target scenes are assumed diffuse.
+        // CIE 1931 Y integral for spectral.
         void put(const SurfaceInteraction3f &si, const Spectrum &value, const Mask &active) {
             Float lum = luminance(unpolarized_spectrum(value), si.wavelengths, active);
-            for (size_t i = 0; i < lightmaps.size(); i++) {
+            for (size_t i = 0; i < lightmaps.size(); ++i) {
                 Mask on_this = active && (si.shape == ShapePtr(lightmaps[i].shape));
                 // No any_or guard: inside dr::while_loop recording, any_or<false>
                 // evaluates the symbolic mask as false and silently drops the
-                // scatter_add from the compiled kernel. scatter_add with a
-                // fully-false mask is a no-op at runtime.
-                UInt32 px  = dr::minimum(UInt32(si.uv.x() * lightmaps[i].width),  lightmaps[i].width  - 1);
-                UInt32 py  = dr::minimum(UInt32(si.uv.y() * lightmaps[i].height), lightmaps[i].height - 1);
+                // scatter_add. scatter_add with a fully-false mask is a no-op.
+
+                Point2f uv;
+                if (lightmaps[i].has_uv) {
+                    uv = si.uv;
+                } else {
+                    // Planar projection: map world position onto the two non-normal axes.
+                    Float u = (world_component(si, lightmaps[i].uv_axis0)
+                               - lightmaps[i].uv_origin0) * lightmaps[i].uv_inv_size0;
+                    Float v = (world_component(si, lightmaps[i].uv_axis1)
+                               - lightmaps[i].uv_origin1) * lightmaps[i].uv_inv_size1;
+                    uv = Point2f(u, v);
+                }
+
+                UInt32 px  = dr::minimum(UInt32(uv.x() * lightmaps[i].width),  lightmaps[i].width  - 1);
+                UInt32 py  = dr::minimum(UInt32(uv.y() * lightmaps[i].height), lightmaps[i].height - 1);
                 UInt32 idx = py * lightmaps[i].width + px;
                 dr::scatter_add(lightmaps[i].data, lum, idx, on_this);
             }
@@ -109,7 +175,7 @@ public:
             // Each pixel covers world-space area = surface_area / (W * H).
             // Irradiance = flux / pixel_area = flux * W*H / surface_area.
             UInt32 pixel_idx = dr::arange<UInt32>(pixels);
-            for (uint32_t i = 0; i < (uint32_t) N; i++) {
+            for (uint32_t i = 0; i < (uint32_t) N; ++i) {
                 ScalarFloat inv_pixel_area =
                     ScalarFloat(lightmaps[i].width * lightmaps[i].height) / lightmaps[i].surface_area;
                 UInt32 base = i * pixels;
