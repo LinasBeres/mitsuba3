@@ -62,7 +62,7 @@ public:
                 lm.data         = dr::zeros<DynamicBuffer<Float>>(res * res);
                 lightmaps.push_back(std::move(lm));
             }
-            std::cerr << "Created a light map with length: " << lightmaps.size() << "\n";
+            Log(Info, "ltracer: prepared %zu receiver lightmap(s)", lightmaps.size());
         }
 
         // Accumulates incoming irradiance as scalar lux (pre-BSDF).
@@ -176,7 +176,6 @@ public:
             total_samples, requested,
             m_sample_mode == "per_pixel" ? "spp" : "total",
             m_sample_mode.c_str());
-        std::cerr << "ltracer: shooting " << total_samples << " rays ( " << requested << " " << (m_sample_mode == "per_pixel" ? "spp" : "total") << " " << m_sample_mode.c_str() << " mode)\n";
 
         // Independent sampler — no sensor required.
         ref<Sampler> sampler =
@@ -252,7 +251,7 @@ public:
                            Spectrum throughput, ScalarFloat sample_scale,
                            Mask active) const {
         Float eta(1.f);
-        Int32 depth = 1;
+        Int32 depth = 0;  // depth=0 before first bounce; max_depth=1 means 1 surface hit
 
         PreliminaryIntersection3f pi =
             scene->ray_intersect_preliminary(ray, active);
@@ -281,11 +280,17 @@ public:
 
             BSDFPtr bsdf = si.bsdf(ls.ray);
 
-            // Receiver accumulation
+            // Receiver accumulation.
+            // Accumulate throughput directly — do NOT multiply by cos(theta_i).
+            // The particle weight w = Le*A*pi already encodes emitter importance.
+            // Particle density at a surface point encodes cos(theta_i) implicitly:
+            // p(hit dA) = cos(theta_e)/pi * cos(theta_r)/r^2 * dA.
+            // Multiplying by cos(theta_r) again gives cos^2 and breaks power
+            // conservation. This is equivalent to Jensen's photon mapping formula
+            // E_pixel = sum(Phi_k) / pixel_area (no extra cosine).
             Mask on_receiver = m_receiver.is_receiver(si.shape);
             if (dr::any_or<true>(on_receiver)) {
-                Float cos_theta_i = Frame3f::cos_theta(si.wi);
-                Spectrum contrib = ls.throughput * dr::maximum(0.f, cos_theta_i) * sample_scale;
+                Spectrum contrib = ls.throughput * sample_scale;
                 m_receiver.put(si, contrib, ls.active && on_receiver);
             }
 
