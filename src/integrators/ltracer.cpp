@@ -238,10 +238,11 @@ public:
             total_samples = requested * total_pixels;
         }
 
-        Log(Info, "ltracer: shooting %u rays (%u %s, %s mode)",
+        Log(Info, "ltracer: shooting %u rays (%u %s, %s mode) with max depth %u",
             total_samples, requested,
             m_sample_mode == "per_pixel" ? "spp" : "total",
-            m_sample_mode.c_str());
+            m_sample_mode.c_str(),
+            m_max_depth);
 
         // Independent sampler — no sensor required.
         ref<Sampler> sampler =
@@ -265,6 +266,57 @@ public:
         }
 
         return m_receiver.develop();
+    }
+
+    // =========================================================
+    // render_backward() — reverse-mode derivative of the light trace.
+    //
+    // Invocation path (verify with the test in main.py):
+    //   mi.render(scene, params) installs a _RenderOp dr.CustomOp
+    //     → dr.backward(loss) traverses the AD graph
+    //     → CustomOp.backward()  (src/python/python/util.py)
+    //     → integrator.render_backward(scene, params, grad_in, sensor, seed, spp)
+    //     → THIS method.
+    //
+    // grad_in is dL/d(atlas), same [N, H, W] layout returned by render()/develop().
+    //
+    // ── Phase 3, step 1: naive AD (this implementation) ──────────────────────
+    // Re-run the forward trace with LoopRecord OFF and gradient tracking live,
+    // then back-propagate from (atlas * grad_in). Dr.JIT's AD graph carries the
+    // gradient through develop()'s area normalization → SurfaceReceiver::put()'s
+    // scatter_add → throughput → emitter parameters, automatically, for ANY
+    // number of bounces and ANY differentiable emitter/geometry parameter.
+    //
+    // This is the linear-memory adjoint: correct but stores the whole primal
+    // graph, so memory grows with spp × depth. That is the KNOWN limitation
+    // (see docs/ltrace-architecture.md). The multi-pass path-replay version
+    // (primal populate → δ per particle from the atlas gradient → attached
+    // replay) will replace the BODY of this method later; the signature and the
+    // mi.render → render_backward plumbing verified here stay identical.
+    // =========================================================
+
+    void render_backward(Scene *scene, void * /*params*/,
+                         const TensorXf &grad_in, Sensor *sensor,
+                         UInt32 seed, uint32_t spp) override {
+        Log(Info, "ltracer::render_backward invoked (spp=%u) — dr.backward "
+                  "routed into the integrator", spp);
+
+        auto backward_gradients = [&]() {
+            // Forward pass WITH gradients live (render() does not suspend grad).
+            // Emitter/geometry params must already have grad enabled by the caller.
+            TensorXf atlas = render(scene, sensor, seed, spp, true, false);
+
+            // Seed the reverse traversal with dL/d(atlas) and propagate.
+            dr::backward_from((atlas * grad_in).array());
+        };
+
+        if constexpr (dr::is_jit_v<Float>) {
+            // Recorded loops are opaque to AD — evaluate the trace loop instead.
+            dr::scoped_set_flag scope(JitFlag::LoopRecord, false);
+            backward_gradients();
+        } else {
+            backward_gradients();
+        }
     }
 
     // =========================================================
