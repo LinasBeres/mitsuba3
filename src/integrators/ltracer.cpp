@@ -1,6 +1,7 @@
 // View-independent light tracer integrator for architectural illuminance evaluation.
 
 #include "mitsuba/core/spectrum.h"
+#include <algorithm>
 #include <cstdint>
 #include <mitsuba/core/plugin.h>
 #include <mitsuba/core/properties.h>
@@ -43,6 +44,7 @@ public:
             uint32_t width, height;
             ScalarFloat surface_area;    // world-space area of the shape, for lux normalization
             DynamicBuffer<Float> data;   // accumulated flux per pixel (before normalization)
+            DynamicBuffer<Float> adjoint; // δ = ∂L/∂flux per pixel (constant-memory backward pass)
 
             // Planar-projection fallback for meshes without UV texture coordinates.
             // uv_axis0/1 are the two world axes (0=X,1=Y,2=Z) that map to U and V.
@@ -109,6 +111,18 @@ public:
 
                 lightmaps.push_back(std::move(lm));
             }
+
+            // scene->shapes() is returned in a per-load (hash/merge) order, so
+            // without this sort the atlas slice ↔ shape mapping would change from
+            // one mi.load_file() to the next. Sort by shape id() to pin a stable,
+            // deterministic atlas order. receiver_shape_ids() walks this same
+            // vector, so Python sees the identical order (use it, don't re-filter
+            // scene.shapes() on the Python side).
+            std::sort(lightmaps.begin(), lightmaps.end(),
+                      [](const Lightmap &a, const Lightmap &b) {
+                          return a.shape->id() < b.shape->id();
+                      });
+
             Log(Info, "ltracer: prepared %zu receiver lightmap(s)", lightmaps.size());
         }
 
@@ -119,34 +133,94 @@ public:
             return si.p.z();
         }
 
-        // Accumulates incoming flux as scalar lux.
-        // luminance() handles all variants: Rec.709 weights for RGB,
-        // CIE 1931 Y integral for spectral.
+        // Map a surface interaction to this lightmap's [0,1]^2 UV. For receivers
+        // without texcoords we project world position onto the two non-normal
+        // axes — note this makes uv a function of si.p, so an si.p attached to the
+        // emitter ray yields an attached uv (the hook for position/tilt grads).
+        Point2f uv_for(const SurfaceInteraction3f &si, size_t i) const {
+            if (lightmaps[i].has_uv)
+                return si.uv;
+            Float u = (world_component(si, lightmaps[i].uv_axis0)
+                       - lightmaps[i].uv_origin0) * lightmaps[i].uv_inv_size0;
+            Float v = (world_component(si, lightmaps[i].uv_axis1)
+                       - lightmaps[i].uv_origin1) * lightmaps[i].uv_inv_size1;
+            return Point2f(u, v);
+        }
+
+        // Bilinear splat of scalar lux into the lightmap `data` (forward primal).
+        //
+        // Deposits to the 4 pixels around the continuous UV, weighted by the
+        // fractional position, instead of a single nearest pixel. This makes the
+        // lightmap a SMOOTH function of uv — which is exactly what lets the
+        // adjoint (gather()) carry a nonzero gradient w.r.t. uv, i.e. w.r.t.
+        // emitter position/tilt. A nearest-pixel (integer floor) splat has zero
+        // uv-derivative and kills all geometry gradients. Weights sum to 1, so
+        // this is energy-conserving except for taps that fall off the map edge
+        // (masked out).
         void put(const SurfaceInteraction3f &si, const Spectrum &value, const Mask &active) {
             Float lum = luminance(unpolarized_spectrum(value), si.wavelengths, active);
             for (size_t i = 0; i < lightmaps.size(); ++i) {
                 Mask on_this = active && (si.shape == ShapePtr(lightmaps[i].shape));
-                // No any_or guard: inside dr::while_loop recording, any_or<false>
-                // evaluates the symbolic mask as false and silently drops the
-                // scatter_add. scatter_add with a fully-false mask is a no-op.
 
-                Point2f uv;
-                if (lightmaps[i].has_uv) {
-                    uv = si.uv;
-                } else {
-                    // Planar projection: map world position onto the two non-normal axes.
-                    Float u = (world_component(si, lightmaps[i].uv_axis0)
-                               - lightmaps[i].uv_origin0) * lightmaps[i].uv_inv_size0;
-                    Float v = (world_component(si, lightmaps[i].uv_axis1)
-                               - lightmaps[i].uv_origin1) * lightmaps[i].uv_inv_size1;
-                    uv = Point2f(u, v);
+                int Wp = (int) lightmaps[i].width, Hp = (int) lightmaps[i].height;
+                Point2f uv = uv_for(si, i);
+
+                // Continuous pixel coordinate (pixel centers at integer + 0.5).
+                Float fx = uv.x() * float(Wp) - 0.5f,
+                      fy = uv.y() * float(Hp) - 0.5f;
+                Float x0f = dr::floor(fx), y0f = dr::floor(fy);
+                Float wx1 = fx - x0f, wy1 = fy - y0f;   // fractional part
+                Float wx0 = 1.f - wx1, wy0 = 1.f - wy1;
+                Int32 x0 = Int32(x0f), y0 = Int32(y0f);
+
+                for (int t = 0; t < 4; ++t) {
+                    Int32 xx = x0 + (t & 1), yy = y0 + (t >> 1);
+                    Float w  = ((t & 1) ? wx1 : wx0) * ((t >> 1) ? wy1 : wy0);
+                    Mask in_bounds = (xx >= 0) && (xx < Wp) && (yy >= 0) && (yy < Hp);
+                    Int32 cx = dr::maximum(dr::minimum(xx, Wp - 1), 0);
+                    Int32 cy = dr::maximum(dr::minimum(yy, Hp - 1), 0);
+                    UInt32 idx = UInt32(cy * Wp + cx);
+                    dr::scatter_add(lightmaps[i].data, w * lum, idx, on_this && in_bounds);
                 }
-
-                UInt32 px  = dr::minimum(UInt32(uv.x() * lightmaps[i].width),  lightmaps[i].width  - 1);
-                UInt32 py  = dr::minimum(UInt32(uv.y() * lightmaps[i].height), lightmaps[i].height - 1);
-                UInt32 idx = py * lightmaps[i].width + px;
-                dr::scatter_add(lightmaps[i].data, lum, idx, on_this);
             }
+        }
+
+        // Adjoint-transpose of put(): bilinear READ of δ at the continuous UV.
+        //
+        //   result = Σ_taps w_k(uv) · δ[tap_k]
+        //
+        // The weights w_k are attached to uv (so ∂result/∂uv ≠ 0 — the spatial
+        // redistribution signal), while δ is a detached constant. The tap layout,
+        // weights, and bounds MUST match put() exactly, or the gradient is a
+        // biased estimate of the wrong quantity. The floor is detached so only
+        // the fractional weights (not the integer cell choice) carry gradient.
+        Float gather(const SurfaceInteraction3f &si, const Mask &active) const {
+            Float result = 0.f;
+            for (size_t i = 0; i < lightmaps.size(); ++i) {
+                Mask on_this = active && (si.shape == ShapePtr(lightmaps[i].shape));
+
+                int Wp = (int) lightmaps[i].width, Hp = (int) lightmaps[i].height;
+                Point2f uv = uv_for(si, i);
+
+                Float fx = uv.x() * float(Wp) - 0.5f,
+                      fy = uv.y() * float(Hp) - 0.5f;
+                Float x0f = dr::detach(dr::floor(fx)), y0f = dr::detach(dr::floor(fy));
+                Float wx1 = fx - x0f, wy1 = fy - y0f;
+                Float wx0 = 1.f - wx1, wy0 = 1.f - wy1;
+                Int32 x0 = Int32(x0f), y0 = Int32(y0f);
+
+                for (int t = 0; t < 4; ++t) {
+                    Int32 xx = x0 + (t & 1), yy = y0 + (t >> 1);
+                    Float w  = ((t & 1) ? wx1 : wx0) * ((t >> 1) ? wy1 : wy0);
+                    Mask in_bounds = (xx >= 0) && (xx < Wp) && (yy >= 0) && (yy < Hp);
+                    Int32 cx = dr::maximum(dr::minimum(xx, Wp - 1), 0);
+                    Int32 cy = dr::maximum(dr::minimum(yy, Hp - 1), 0);
+                    UInt32 idx = UInt32(cy * Wp + cx);
+                    Float d = dr::gather<Float>(lightmaps[i].adjoint, idx, on_this && in_bounds);
+                    result += w * d;
+                }
+            }
+            return result;
         }
 
         Mask is_receiver(ShapePtr shape) const {
@@ -221,6 +295,20 @@ public:
 
     TensorXf render(Scene *scene, Sensor * /*ignored*/, UInt32 seed,
                     uint32_t spp, bool /* develop */, bool /* evaluate */) override {
+        trace_passes(scene, seed, spp);
+        return m_receiver.develop();
+    }
+
+    // =========================================================
+    // trace_passes() — prepare receivers and shoot all particle passes,
+    // accumulating primal flux into each lightmap's `data` buffer.
+    //
+    // Everything the forward render() does EXCEPT develop(). Factored out so the
+    // backward pass can reuse the identical primal trace (Step 1) inside a
+    // suspend_grad scope, without re-running atlas normalization.
+    // =========================================================
+
+    void trace_passes(Scene *scene, UInt32 seed, uint32_t spp) {
         m_receiver.prepare(scene);
 
         // Resolve sample count.
@@ -264,8 +352,6 @@ public:
 
             samples_done += wavefront_size;
         }
-
-        return m_receiver.develop();
     }
 
     // =========================================================
@@ -280,43 +366,129 @@ public:
     //
     // grad_in is dL/d(atlas), same [N, H, W] layout returned by render()/develop().
     //
-    // ── Phase 3, step 1: naive AD (this implementation) ──────────────────────
-    // Re-run the forward trace with LoopRecord OFF and gradient tracking live,
-    // then back-propagate from (atlas * grad_in). Dr.JIT's AD graph carries the
-    // gradient through develop()'s area normalization → SurfaceReceiver::put()'s
-    // scatter_add → throughput → emitter parameters, automatically, for ANY
-    // number of bounces and ANY differentiable emitter/geometry parameter.
+    // ── Constant-memory adjoint (path-replay structure) ──────────────────────
+    // Three stages, none of which retains the full primal path graph, so peak
+    // memory is O(atlas size) — independent of spp and path depth:
     //
-    // This is the linear-memory adjoint: correct but stores the whole primal
-    // graph, so memory grows with spp × depth. That is the KNOWN limitation
-    // (see docs/ltrace-architecture.md). The multi-pass path-replay version
-    // (primal populate → δ per particle from the atlas gradient → attached
-    // replay) will replace the BODY of this method later; the signature and the
-    // mi.render → render_backward plumbing verified here stay identical.
+    //   Step 1  Primal, DETACHED. Trace all particles under suspend_grad,
+    //           accumulating primal flux into each lightmap's `data`. No AD
+    //           graph is built, so depth/spp cost no adjoint memory.
+    //
+    //   Step 2  Adjoint of develop(). develop() is a diagonal linear map
+    //           (atlas[i,p] = data[i,p] * inv_pixel_area_i), so its adjoint is
+    //           the SAME per-pixel rescale of grad_in. We let AD compute it:
+    //           enable grad on the (leaf) lightmaps, run develop() once, seed
+    //           grad_in on the atlas, traverse back. The result δ_i = grad(data)
+    //           is the "adjoint lightmap" — same shape as data, but each pixel
+    //           holds ∂L/∂flux instead of luminance. The atlas→surface routing
+    //           is exactly the inverse of develop()'s packing scatter.
+    //
+    //   Pass 2  Attached replay (TODO). Re-trace the SAME particles with emitter
+    //           params attached; at each receiver hit GATHER δ_i[pixel] (mirror
+    //           of Step 1's scatter_add) and accumulate
+    //               proxy += luminance(throughput_attached) * δ_i[pixel]
+    //           then dr::backward(proxy) to deposit gradient onto params. Only
+    //           the current wavefront's graph is live, so memory stays constant.
     // =========================================================
 
     void render_backward(Scene *scene, void * /*params*/,
-                         const TensorXf &grad_in, Sensor *sensor,
+                         const TensorXf &grad_in, Sensor * /*sensor*/,
                          UInt32 seed, uint32_t spp) override {
-        Log(Info, "ltracer::render_backward invoked (spp=%u) — dr.backward "
-                  "routed into the integrator", spp);
+        Log(Info, "ltracer::render_backward invoked (spp=%u) — constant-memory "
+                  "adjoint (one-bounce test path)", spp);
 
-        auto backward_gradients = [&]() {
-            // Forward pass WITH gradients live (render() does not suspend grad).
-            // Emitter/geometry params must already have grad enabled by the caller.
-            TensorXf atlas = render(scene, sensor, seed, spp, true, false);
+        m_receiver.prepare(scene);
 
-            // Seed the reverse traversal with dL/d(atlas) and propagate.
-            dr::backward_from((atlas * grad_in).array());
-        };
-
-        if constexpr (dr::is_jit_v<Float>) {
-            // Recorded loops are opaque to AD — evaluate the trace loop instead.
-            dr::scoped_set_flag scope(JitFlag::LoopRecord, false);
-            backward_gradients();
-        } else {
-            backward_gradients();
+        // Resolve sample count (mirrors trace_passes; the one-bounce test uses a
+        // single wavefront so the whole thing replays with one sampler state).
+        uint32_t requested = (spp > 0) ? spp : m_default_spp;
+        if (requested == 0)
+            requested = (m_sample_mode == "per_pixel") ? 64u : (1u << 20);
+        uint32_t total_samples = requested;
+        if (m_sample_mode == "per_pixel") {
+            uint32_t total_pixels = 0;
+            for (auto &lm : m_receiver.lightmaps)
+                total_pixels += lm.width * lm.height;
+            total_samples = requested * total_pixels;
         }
+        ScalarFloat scale = 1.f / ScalarFloat(total_samples);
+
+        // Set up the sampler HERE and CLONE it before the primal pass. clone()
+        // copies the PCG32 state, so the attached replay (Pass 2) re-draws the
+        // IDENTICAL emitter samples and reproduces the same first-hit pixels the
+        // primal deposited into — which is what makes δ line up with the paths.
+        ref<Sampler> sampler =
+            PluginManager::instance()->create_object<Sampler>(Properties("independent"));
+        sampler->seed(seed, total_samples);
+        ref<Sampler> sampler_replay = sampler->clone();
+
+        // ---- Step 1: PRIMAL, detached ------------------------------------------
+        // One wavefront, gradients suspended → no path graph retained.
+        {
+            dr::suspend_grad<Float> no_grad;
+            sample(scene, nullptr, sampler.get(), nullptr, scale);
+            for (auto &lm : m_receiver.lightmaps)
+                dr::eval(lm.data);
+        }
+
+        // ---- Step 2: adjoint of develop() → δ ----------------------------------
+        // Make each lightmap a differentiable leaf, record only develop(), then
+        // back-propagate grad_in through it. δ_i = ∂L/∂data[i] lands per surface.
+        for (auto &lm : m_receiver.lightmaps)
+            dr::enable_grad(lm.data);
+
+        TensorXf atlas = m_receiver.develop();
+        dr::backward_from((atlas * grad_in).array());
+
+        for (auto &lm : m_receiver.lightmaps) {
+            lm.adjoint = dr::grad(lm.data);   // the "adjoint lightmap"
+            dr::eval(lm.adjoint);
+            dr::disable_grad(lm.data);        // detach again; Step 2 graph is done
+        }
+
+        // ---- Pass 2: attached replay (one bounce) ------------------------------
+        adjoint_pass(scene, sampler_replay.get(), scale);
+    }
+
+    // =========================================================
+    // adjoint_pass() — one-bounce attached replay.
+    //
+    // Re-draws the SAME emitter samples as Step 1 (cloned sampler), re-traces to
+    // the first hit, gathers δ at that pixel, and back-propagates the deposited
+    // luminance to the emitter parameters. No loop: for one bounce all that's
+    // needed is prepare_ray + the first intersection.
+    //
+    // Correctness: the primal deposited  data[pixel] = Σ luminance(w · scale).
+    // δ[pixel] = ∂L/∂data[pixel] (a detached constant from Step 2). Each replayed
+    // particle contributes  δ[pixel] · luminance(w_attached · scale), and
+    //   Σ_particles δ · ∂luminance/∂θ = Σ_pixel δ · ∂data/∂θ = ∂L/∂θ.
+    // =========================================================
+
+    void adjoint_pass(const Scene *scene, Sampler *sampler,
+                      ScalarFloat sample_scale) const {
+        // Emitter parameters (e.g. radiance) must already have grad enabled by
+        // the caller. prepare_ray is ATTACHED — the ray weight carries ∂/∂θ.
+        auto [ray, throughput] = prepare_ray(scene, sampler);
+
+        Float throughput_max = dr::max(unpolarized_spectrum(throughput));
+        Mask active = (throughput_max != 0.f);
+
+        // First (and, for one bounce, only) intersection. si is detached w.r.t.
+        // radiance — the pixel it selects does not depend on emitter intensity.
+        SurfaceInteraction3f si = scene->ray_intersect(ray, active);
+        active &= si.is_valid() && m_receiver.is_receiver(si.shape);
+
+        // Luminance this particle deposited, attached to the emitter params.
+        Spectrum contrib = throughput * sample_scale;
+        Float lum = luminance(unpolarized_spectrum(contrib), si.wavelengths, active);
+
+        // δ at the hit pixel — mirror of Pass 1's scatter_add.
+        Float delta = m_receiver.gather(si, active);
+
+        // proxy = Σ δ · luminance(contrib); backward deposits ∂L/∂θ onto params.
+        Float proxy = dr::select(active, delta * lum, 0.f);
+        Float total = dr::sum(proxy);
+        dr::backward(total);
     }
 
     // =========================================================
@@ -399,7 +571,6 @@ public:
             BSDFPtr bsdf = si.bsdf(ls.ray);
 
             // Receiver accumulation.
-            // Accumulate throughput directly — do NOT multiply by cos(theta_i).
             // The particle weight w = Le*A*pi already encodes emitter importance.
             // Particle density at a surface point encodes cos(theta_i) implicitly:
             // p(hit dA) = cos(theta_e)/pi * cos(theta_r)/r^2 * dA.
