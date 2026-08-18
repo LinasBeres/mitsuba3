@@ -318,16 +318,23 @@ public:
         if (requested == 0)
             requested = (m_sample_mode == "per_pixel") ? 64u : (1u << 20);
 
-        uint32_t total_samples = requested;
+        // 64-bit: in per_pixel mode this is spp x (sum of all lightmap pixels),
+        // which overflows 32 bits easily — 2^21 spp over 8 receivers at 64^2 is
+        // exactly 2^36, which truncated to 0 and silently rendered a BLACK
+        // atlas with no warning. Keep the product in 64 bits and clamp.
+        uint64_t total_samples = requested;
         if (m_sample_mode == "per_pixel") {
-            uint32_t total_pixels = 0;
+            uint64_t total_pixels = 0;
             for (auto &lm : m_receiver.lightmaps)
-                total_pixels += lm.width * lm.height;
-            total_samples = requested * total_pixels;
+                total_pixels += (uint64_t) lm.width * lm.height;
+            total_samples = (uint64_t) requested * total_pixels;
         }
+        if (total_samples == 0)
+            Throw("ltracer: resolved sample count is zero (requested=%u, mode=%s)",
+                  requested, m_sample_mode.c_str());
 
-        Log(Info, "ltracer: shooting %u rays (%u %s, %s mode) with max depth %u",
-            total_samples, requested,
+        Log(Info, "ltracer: shooting %llu rays (%u %s, %s mode) with max depth %u",
+            (unsigned long long) total_samples, requested,
             m_sample_mode == "per_pixel" ? "spp" : "total",
             m_sample_mode.c_str(),
             m_max_depth);
@@ -337,11 +344,11 @@ public:
             PluginManager::instance()->create_object<Sampler>(Properties("independent"));
 
         ScalarFloat scale = 1.f / ScalarFloat(total_samples);
-        uint32_t samples_done = 0;
+        uint64_t samples_done = 0;
 
         while (samples_done < total_samples) {
-            uint32_t wavefront_size =
-                std::min((uint32_t) m_samples_per_pass, total_samples - samples_done);
+            uint32_t wavefront_size = (uint32_t) std::min(
+                (uint64_t) m_samples_per_pass, total_samples - samples_done);
 
             sampler->seed(seed + samples_done, wavefront_size);
             sample(scene, nullptr, sampler.get(), nullptr, scale);
