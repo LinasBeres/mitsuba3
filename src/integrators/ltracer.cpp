@@ -42,7 +42,16 @@ public:
         struct Lightmap {
             const Shape *shape;
             uint32_t width, height;
-            ScalarFloat surface_area;    // world-space area of the shape, for lux normalization
+            ScalarFloat surface_area;    // world-space area of the shape
+            // World-space area covered by ONE texel. NOT simply
+            // surface_area/(W*H): that is only right when the shape fills its UV
+            // unit square. A concave receiver whose UVs are a planar projection
+            // over its BOUNDING BOX leaves part of the square empty, and every
+            // reported lux value is then scaled by bbox_area/surface_area (the
+            // Sydney floor is 675.4 m^2 in an 890.2 m^2 bbox — a silent 1.32x
+            // overestimate). Computed from the UV-space area, so it stays exact
+            // for both cases. See prepare().
+            ScalarFloat texel_area;
             DynamicBuffer<Float> data;   // accumulated flux per pixel (before normalization)
             DynamicBuffer<Float> adjoint; // δ = ∂L/∂flux per pixel (constant-memory backward pass)
 
@@ -64,17 +73,13 @@ public:
             for (auto &shape : scene->shapes()) {
                 if (!shape->is_receiver())
                     continue;
+                // Per-receiver resolution is honoured: develop() builds a RAGGED
+                // atlas (each slice padded up to the largest). Receivers whose
+                // areas differ by orders of magnitude MUST differ in resolution,
+                // or the small ones are all sampling noise.
                 uint32_t res = shape->receiver_resolution();
-                if (first_res == 0) {
+                if (first_res == 0)
                     first_res = res;
-                } else if (res != first_res) {
-                    Log(Warn, "ltracer: receiver '%s' requests resolution %u but all "
-                              "receivers must share the same resolution for the atlas; "
-                              "overriding to %u. Add <integer name=\"receiver_resolution\" "
-                              "value=\"%u\"/> to this shape to silence this warning.",
-                        shape->id(), res, first_res, first_res);
-                    res = first_res;
-                }
                 Lightmap lm;
                 lm.shape        = shape.get();
                 lm.width        = res;
@@ -89,6 +94,37 @@ public:
                 // so cast first and fall back to planar projection for everything else.
                 const Mesh *mesh = dynamic_cast<const Mesh *>(shape.get());
                 lm.has_uv = mesh && mesh->has_vertex_texcoords();
+                if (lm.has_uv) {
+                    // Area of one texel = (world area per unit UV area) / (W*H).
+                    // The Jacobian |d(world)/d(uv)| is surface_area / uv_area,
+                    // summed over the mesh's triangles, which is exact for an
+                    // affine map and a sensible average otherwise. A shape whose
+                    // UVs fill the unit square gives uv_area = 1 and recovers the
+                    // old surface_area/(W*H) — so existing scenes are unchanged.
+                    UInt32 fi = dr::arange<UInt32>(mesh->face_count());
+                    Vector3u vi = mesh->face_indices(fi);
+                    Point2f t0 = mesh->vertex_texcoord(vi.x()),
+                            t1 = mesh->vertex_texcoord(vi.y()),
+                            t2 = mesh->vertex_texcoord(vi.z());
+                    Vector2f e1 = t1 - t0, e2 = t2 - t0;
+                    Float tri_uv = 0.5f * dr::abs(dr::fmsub(e1.x(), e2.y(),
+                                                            e1.y() * e2.x()));
+                    Float uv_sum = dr::sum(tri_uv);
+                    dr::eval(uv_sum);
+                    ScalarFloat uv_area = dr::slice<ScalarFloat>(uv_sum, 0u);
+                    if (uv_area <= 0.f) {
+                        Log(Warn, "ltracer: receiver '%s' has degenerate UVs "
+                                  "(uv area %f); falling back to surface_area/(W*H)",
+                            shape->id(), uv_area);
+                        lm.texel_area = lm.surface_area / ScalarFloat(res * res);
+                    } else {
+                        lm.texel_area = (lm.surface_area / uv_area) /
+                                        ScalarFloat(res * res);
+                        Log(Info, "ltracer: receiver '%s' area %.2f m^2, uv area "
+                                  "%.4f, texel %.6g m^2",
+                            shape->id(), lm.surface_area, uv_area, lm.texel_area);
+                    }
+                }
                 if (!lm.has_uv) {
                     // Identify the surface's dominant normal axis by finding which
                     // world axis has the smallest bounding-box extent — that axis is
@@ -104,6 +140,11 @@ public:
                     lm.uv_origin1    = bb.min[lm.uv_axis1];
                     lm.uv_inv_size0  = (ext[lm.uv_axis0] > 0) ? (1.f / ext[lm.uv_axis0]) : 1.f;
                     lm.uv_inv_size1  = (ext[lm.uv_axis1] > 0) ? (1.f / ext[lm.uv_axis1]) : 1.f;
+                    // The planar projection maps the bbox extent onto [0,1]^2,
+                    // so one texel covers ext0*ext1/(W*H) of the projected plane
+                    // directly — no UV-area correction needed or possible.
+                    lm.texel_area = (ext[lm.uv_axis0] * ext[lm.uv_axis1]) /
+                                    ScalarFloat(res * res);
                     Log(Warn, "ltracer: receiver '%s' has no UV coords — "
                               "falling back to planar projection (axes %d, %d)",
                         shape->id(), lm.uv_axis0, lm.uv_axis1);
@@ -234,26 +275,35 @@ public:
             if (lightmaps.empty())
                 return TensorXf();
 
-            size_t   N      = lightmaps.size();
-            uint32_t H      = lightmaps[0].height;  // assumes uniform resolution
-            uint32_t W      = lightmaps[0].width;
+            // RAGGED atlas: receivers may have DIFFERENT resolutions, because a
+            // 2 m² worktop and a 675 m² floor cannot share a texel count — at the
+            // floor's resolution the worktop's texels are ~80x finer, almost none
+            // receive a particle, and it reads pure sampling noise. Each lightmap
+            // is written into the TOP-LEFT of a [Hmax, Wmax] slice and the rest
+            // left at zero; Python crops each slice to that shape's
+            // receiver_resolution() (which is bound, unlike our custom methods).
+            size_t   N = lightmaps.size();
+            uint32_t H = 0, W = 0;
+            for (auto &lm : lightmaps) {
+                H = std::max(H, lm.height);
+                W = std::max(W, lm.width);
+            }
             uint32_t pixels = H * W;
 
-            // Build interleaved atlas: layout [N, H, W, 3]
-            // atlas[ i*pixels*3 + j*3 + c ] = lightmap[i].channel[c][j]
-            // Concatenate per-surface lux maps into [N, H, W]
+            // zeros(), not empty(): the padding must read as unlit, not garbage.
             DynamicBuffer<Float> atlas =
-                dr::empty<DynamicBuffer<Float>>(N * pixels);
+                dr::zeros<DynamicBuffer<Float>>(N * pixels);
 
-            // Normalize accumulated flux by pixel area to get irradiance (lux / W/m²).
-            // Each pixel covers world-space area = surface_area / (W * H).
-            // Irradiance = flux / pixel_area = flux * W*H / surface_area.
-            UInt32 pixel_idx = dr::arange<UInt32>(pixels);
+            // Normalize accumulated flux by texel area to get irradiance (lux).
+            // texel_area is computed in prepare() from the UV-space area, NOT as
+            // surface_area/(W*H) — see the Lightmap::texel_area comment.
             for (uint32_t i = 0; i < (uint32_t) N; ++i) {
-                ScalarFloat inv_pixel_area =
-                    ScalarFloat(lightmaps[i].width * lightmaps[i].height) / lightmaps[i].surface_area;
-                UInt32 base = i * pixels;
-                dr::scatter(atlas, lightmaps[i].data * inv_pixel_area, pixel_idx + base);
+                ScalarFloat inv_pixel_area = 1.f / lightmaps[i].texel_area;
+                uint32_t lw = lightmaps[i].width, lh = lightmaps[i].height;
+                UInt32 p   = dr::arange<UInt32>(lw * lh);
+                UInt32 row = p / lw, col = p - row * lw;
+                UInt32 dst = i * pixels + row * W + col;
+                dr::scatter(atlas, lightmaps[i].data * inv_pixel_area, dst);
             }
 
             size_t shape[3] = { N, (size_t) H, (size_t) W };
