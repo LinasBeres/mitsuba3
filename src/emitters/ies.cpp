@@ -32,6 +32,19 @@ IES photometric light source (:monosp:`ies`)
      e.g. Sydney's per-fixture scale_factor). (Default: 1)
    - |exposed|, |differentiable|
 
+ * - aim_tilt
+   - |float|
+   - Aim: angle in DEGREES by which the fixture leans away from straight-down
+     (0 = nadir along local -Z). (Default: 0)
+   - |exposed|, |differentiable|
+
+ * - aim_azimuth
+   - |float|
+   - Aim: direction of the lean in DEGREES, measured in the local XY plane from
+     +X toward +Y. Also spins the profile about the vertical, which is what a
+     real fixture does when its mount is rotated. (Default: 0)
+   - |exposed|, |differentiable|
+
  * - to_world
    - |transform|
    - Emitter-to-world transform. In local space the luminaire sits at the origin
@@ -46,8 +59,9 @@ so this drops straight into the view-independent lux pipeline.
 Directions are importance-sampled proportional to I(theta,phi)*sin(theta) (flux
 measure), the standard goniometric/envmap scheme.
 
-Phase 1: forward only. `to_world` is non-differentiable (aim derivatives come in
-Phase 2 via an attached aim rotation). Type C photometry; rotationally symmetric
+`to_world` stays non-differentiable: fixture AIM is exposed separately as the
+differentiable pair (`aim_tilt`, `aim_azimuth`), applied as an explicit rotation
+in the local frame (see `aim_rotate`). Type C photometry; rotationally symmetric
 (one horizontal angle) or a full explicit horizontal range.
  */
 
@@ -62,13 +76,15 @@ public:
 
     IESLight(const Properties &props) : Base(props) {
         m_flags  = +EmitterFlags::DeltaPosition;
-        m_scale  = props.get<ScalarFloat>("scale", 1.f);
+        m_scale        = props.get<ScalarFloat>("scale", 1.f);
+        m_aim_tilt     = props.get<ScalarFloat>("aim_tilt", 0.f);
+        m_aim_azimuth  = props.get<ScalarFloat>("aim_azimuth", 0.f);
 
         fs::path file_path = Thread::thread()->file_resolver()->resolve(
             props.get<std::string>("filename"));
         parse_ies(file_path);
 
-        dr::make_opaque(m_scale);
+        dr::make_opaque(m_scale, m_aim_tilt, m_aim_azimuth);
     }
 
     // ── LM-63 parser ────────────────────────────────────────────────────────
@@ -230,10 +246,60 @@ public:
         return Vector3f(st * cp, st * sp, -ct);
     }
 
+    // ── Aim rotation ────────────────────────────────────────────────────────
+    // R(tilt, azimuth) = Rz(azimuth) * Ry(-tilt), applied in the emitter's LOCAL
+    // frame, before to_world. The nadir (0,0,-1) maps to
+    //     (sin t * cos a,  sin t * sin a,  -cos t)
+    // so `tilt` leans the fixture away from straight-down and `azimuth` picks
+    // the lean direction from local +X toward +Y. Azimuth also spins the profile
+    // itself about the vertical — exactly what a real fixture does when its
+    // mount is rotated, and the semantics of Sydney's `azimuth tilt` pair.
+    //
+    // THIS is what carries the aim derivative, and why it works. The rotation is
+    // measure-preserving (dOmega is invariant), so a rotated luminaire is
+    //     flux_k(a) = INT I(R^-1 w) V(w,k) dw = INT I(w') V(R w', k) dw'
+    // i.e. importance sampling can stay entirely in the LOCAL frame: the sampled
+    // direction, its pdf and the emitted weight are all aim-INDEPENDENT, and the
+    // whole derivative flows through the rotated world direction -> first-hit
+    // position -> the bilinear splat weights in the receiver lightmap. No
+    // Jacobian term, no pdf derivative.
+    //
+    // Contrast area.cpp's `Frame3f(ps.n).to_world(...)`: there the sampled local
+    // direction is expressed in an ARBITRARY tangent basis that spins as the
+    // normal rotates, so d(ray.d)/d(theta) picks up an unphysical component and
+    // the rotation gradient is wrong (see docs/PROJECT_STATUS.md, "Tilt is
+    // broken"). R here is an explicit smooth rotation, so there is no basis to
+    // spin.
+    Vector3f aim_rotate(const Vector3f &v) const {
+        auto [st, ct] = dr::sincos(dr::deg_to_rad(m_aim_tilt));
+        auto [sa, ca] = dr::sincos(dr::deg_to_rad(m_aim_azimuth));
+        Vector3f w(v.x() * ct - v.z() * st,          // Ry(-tilt)
+                   v.y(),
+                   v.x() * st + v.z() * ct);
+        return Vector3f(w.x() * ca - w.y() * sa,     // Rz(azimuth)
+                        w.x() * sa + w.y() * ca,
+                        w.z());
+    }
+
+    // Inverse: Ry(tilt) * Rz(-azimuth). Used by the eval/NEE paths so that a
+    // path tracer sees the same aimed fixture as the light tracer.
+    Vector3f aim_unrotate(const Vector3f &v) const {
+        auto [st, ct] = dr::sincos(dr::deg_to_rad(m_aim_tilt));
+        auto [sa, ca] = dr::sincos(dr::deg_to_rad(m_aim_azimuth));
+        Vector3f w(v.x() * ca + v.y() * sa,          // Rz(-azimuth)
+                  -v.x() * sa + v.y() * ca,
+                   v.z());
+        return Vector3f(w.x() * ct + w.z() * st,     // Ry(tilt)
+                        w.y(),
+                       -w.x() * st + w.z() * ct);
+    }
+
     void traverse(TraversalCallback *cb) override {
         Base::traverse(cb);
-        cb->put("scale",    m_scale,    ParamFlags::Differentiable);
-        cb->put("to_world", m_to_world, ParamFlags::NonDifferentiable);
+        cb->put("scale",       m_scale,       ParamFlags::Differentiable);
+        cb->put("aim_tilt",    m_aim_tilt,    ParamFlags::Differentiable);
+        cb->put("aim_azimuth", m_aim_azimuth, ParamFlags::Differentiable);
+        cb->put("to_world",    m_to_world,    ParamFlags::NonDifferentiable);
     }
 
     std::pair<Ray3f, Spectrum> sample_ray(Float time, Float wavelength_sample,
@@ -244,7 +310,11 @@ public:
 
         auto [uv, pdf_unit] = m_distr.sample(spatial_sample, nullptr, active);
         Float sin_theta;
-        Vector3f local_dir = uv_to_local(uv, sin_theta);
+        // Detached on purpose: the sampled LOCAL direction, its pdf and the
+        // emitted weight must not depend on aim (see aim_rotate). uv is already
+        // detached — m_distr is built from host data — so this only documents
+        // intent and guards against a future attached warp.
+        Vector3f local_dir = dr::detach(uv_to_local(uv, sin_theta));
 
         // Unit-square pdf -> solid-angle pdf. Parameter area = phi_range*theta_max;
         // dOmega = sin(theta) dtheta dphi.
@@ -262,7 +332,10 @@ public:
         Float weight = dr::select(active && pdf_omega > 0.f,
                                   m_scale * I / pdf_omega, 0.f);
 
-        return { Ray3f(si.p, m_to_world.value() * local_dir, time, wavelengths),
+        // ray.d is the ONLY aim-attached quantity in this function.
+        Vector3f d = m_to_world.value() * aim_rotate(local_dir);
+
+        return { Ray3f(si.p, d, time, wavelengths),
                  depolarizer<Spectrum>(spec_weight) * weight };
     }
 
@@ -284,7 +357,8 @@ public:
         Float inv_dist = dr::rcp(ds.dist);
         ds.d      *= inv_dist;
 
-        Vector3f local_d = m_to_world.value().inverse() * -ds.d;
+        Vector3f local_d =
+            aim_unrotate(m_to_world.value().inverse() * -ds.d);
         auto [uv, ok] = local_to_uv(local_d);
         active &= ok;
 
@@ -309,14 +383,15 @@ public:
     sample_position(Float time, const Point2f & /*sample*/,
                     Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointSamplePosition, active);
-        Vector3f dir = m_to_world.value() * ScalarVector3f(0.f, 0.f, -1.f);
+        Vector3f dir = m_to_world.value() *
+                       aim_rotate(Vector3f(0.f, 0.f, -1.f));
         PositionSample3f ps(m_to_world.value().translation(), dir,
                             Point2f(0.5f), time, 1.f, true);
         return { ps, Float(1.f) };
     }
 
     std::pair<Wavelength, Spectrum>
-    sample_wavelengths(const SurfaceInteraction3f &si, Float sample,
+    sample_wavelengths(const SurfaceInteraction3f &si, Float /* sample */,
                        Mask active) const override {
         // Uniform "white" photometric emitter: sample wavelengths uniformly and
         // return unit weight (the candela table carries all the magnitude).
@@ -340,6 +415,8 @@ public:
             << "  vert_angles = " << m_vert.size() << ","  << std::endl
             << "  horiz_angles = " << m_horiz.size() << "," << std::endl
             << "  theta_max = " << dr::rad_to_deg(m_theta_max) << " deg," << std::endl
+            << "  aim_tilt = " << m_aim_tilt << " deg," << std::endl
+            << "  aim_azimuth = " << m_aim_azimuth << " deg," << std::endl
             << "  scale = " << m_scale << std::endl
             << "]";
         return oss.str();
@@ -365,13 +442,19 @@ private:
         return { Point2f(u, dr::clip(v, 0.f, 1.f)), ok };
     }
 
-    ScalarFloat m_scale;
+    // Differentiable design variables. Float (not ScalarFloat) is REQUIRED for
+    // these to carry gradients — a ScalarFloat declared `Differentiable` in
+    // traverse() silently does nothing.
+    Float m_scale;
+    Float m_aim_tilt, m_aim_azimuth;                    // degrees
     std::vector<ScalarFloat> m_vert, m_horiz, m_cand;   // parsed table (host)
     ScalarFloat m_theta_max, m_phi_min, m_phi_max;
     bool m_symmetric = true;
     uint32_t m_nt = 0, m_np = 0;
     Warp m_distr;                 // importance sampling over I*sin(theta)
     FloatStorage m_inten;         // raw intensity grid (device), for the weight
+
+    MI_TRAVERSE_CB(Base, m_scale, m_aim_tilt, m_aim_azimuth, m_inten)
 };
 
 MI_EXPORT_PLUGIN(IESLight)
