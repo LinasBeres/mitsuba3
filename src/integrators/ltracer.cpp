@@ -52,8 +52,7 @@ public:
             // overestimate). Computed from the UV-space area, so it stays exact
             // for both cases. See prepare().
             ScalarFloat texel_area;
-            DynamicBuffer<Float> data;   // accumulated flux per pixel (before normalization)
-            DynamicBuffer<Float> adjoint; // δ = ∂L/∂flux per pixel (constant-memory backward pass)
+            uint32_t offset = 0;         // this lightmap's start in the flat buffers
 
             // Planar-projection fallback for meshes without UV texture coordinates.
             // uv_axis0/1 are the two world axes (0=X,1=Y,2=Z) that map to U and V.
@@ -67,7 +66,57 @@ public:
 
         std::vector<Lightmap> lightmaps;
 
+        // ── ONE flat buffer for every receiver, not one buffer each ─────────
+        // put() has to deposit into whichever lightmap the particle hit, which is
+        // only known at runtime. Looping over lightmaps and issuing a masked
+        // scatter_add per candidate costs 4*N scatters per surface hit, and
+        // because each targets a DIFFERENT buffer Dr.JIT cannot fuse them — every
+        // one becomes its own kernel launch. On the Sydney scene (79 receivers)
+        // that was 661 launches and ~0.25 s of pure CPU dispatch per optimisation
+        // iteration, independent of spp and of emitter count, with the GPU idle
+        // ~85% of the time.
+        //
+        // Instead: concatenate all lightmaps into `data`, resolve the receiver
+        // INDEX with a chain of selects (pure ALU, stays in the same kernel), and
+        // read each receiver's geometry out of small device-side tables. put()
+        // then issues exactly 4 scatter_adds into one buffer whatever the scene
+        // size, and gather() 4 gathers.
+        DynamicBuffer<Float> data;      // accumulated flux, all receivers
+        DynamicBuffer<Float> adjoint;   // δ = ∂L/∂flux, all receivers
+        uint32_t total_pixels = 0;
+
+        // Per-receiver tables, indexed by receiver index.
+        DynamicBuffer<UInt32> t_off, t_w, t_h, t_has_uv, t_ax0, t_ax1;
+        DynamicBuffer<Float>  t_org0, t_org1, t_inv0, t_inv1;
+        // Per-flat-pixel tables used by develop(): destination slot in the ragged
+        // atlas, and 1/texel_area for that pixel's receiver.
+        DynamicBuffer<UInt32> d_dst;
+        DynamicBuffer<Float>  d_scale;
+        uint32_t atlas_h = 0, atlas_w = 0;
+
+        // Cached-structure guard. prepare() costs two dr::eval() per receiver
+        // (surface area, then UV area), and it is called by BOTH render() and
+        // render_backward() — 79 receivers meant ~316 kernel launches per
+        // optimisation iteration doing nothing but re-deriving constants. The
+        // receiver set and its texel areas only change when the scene is reloaded
+        // or its geometry is edited, neither of which happens inside an emitter
+        // optimisation loop, so the layout is built once per scene and after that
+        // prepare() just zeroes the accumulator.
+        const Scene *prepared_scene = nullptr;
+        size_t prepared_count = 0;
+
         void prepare(const Scene *scene) {
+            size_t n_recv = 0;
+            for (auto &shape : scene->shapes())
+                if (shape->is_receiver())
+                    ++n_recv;
+            if (scene == prepared_scene && n_recv == prepared_count) {
+                data = dr::zeros<DynamicBuffer<Float>>(total_pixels);
+                return;
+            }
+            prepared_scene = scene;
+            prepared_count = n_recv;
+
             lightmaps.clear();
             uint32_t first_res = 0;
             for (auto &shape : scene->shapes()) {
@@ -87,7 +136,6 @@ public:
                 Float area      = shape->surface_area();
                 dr::eval(area);
                 lm.surface_area = dr::slice<ScalarFloat>(area, 0u);
-                lm.data         = dr::zeros<DynamicBuffer<Float>>(res * res);
 
                 // Only Mesh subclasses carry per-vertex UV coordinates.
                 // Built-in shapes (sphere, rectangle, disk, etc.) never have them,
@@ -164,7 +212,74 @@ public:
                           return a.shape->id() < b.shape->id();
                       });
 
-            Log(Info, "ltracer: prepared %zu receiver lightmap(s)", lightmaps.size());
+            build_tables();
+
+            Log(Info, "ltracer: prepared %zu receiver lightmap(s), %u total pixels",
+                lightmaps.size(), total_pixels);
+        }
+
+        // Lay every lightmap out end-to-end in the flat buffers and upload the
+        // per-receiver / per-pixel lookup tables put(), gather() and develop() need.
+        void build_tables() {
+            size_t N = lightmaps.size();
+            atlas_h = atlas_w = 0;
+            total_pixels = 0;
+            for (auto &lm : lightmaps) {
+                lm.offset = total_pixels;
+                total_pixels += lm.width * lm.height;
+                atlas_h = std::max(atlas_h, lm.height);
+                atlas_w = std::max(atlas_w, lm.width);
+            }
+            if (N == 0) {
+                data = dr::zeros<DynamicBuffer<Float>>(0);
+                return;
+            }
+
+            std::vector<uint32_t> off(N), w(N), h(N), hu(N), a0(N), a1(N);
+            std::vector<ScalarFloat> o0(N), o1(N), i0(N), i1(N);
+            std::vector<uint32_t> dst(total_pixels);
+            std::vector<ScalarFloat> scl(total_pixels);
+            uint32_t slice = atlas_h * atlas_w;
+            for (size_t i = 0; i < N; ++i) {
+                const Lightmap &lm = lightmaps[i];
+                off[i] = lm.offset; w[i] = lm.width; h[i] = lm.height;
+                hu[i] = lm.has_uv ? 1u : 0u;
+                a0[i] = (uint32_t) lm.uv_axis0; a1[i] = (uint32_t) lm.uv_axis1;
+                o0[i] = lm.uv_origin0;   o1[i] = lm.uv_origin1;
+                i0[i] = lm.uv_inv_size0; i1[i] = lm.uv_inv_size1;
+                ScalarFloat inv_area = 1.f / lm.texel_area;
+                for (uint32_t p = 0; p < lm.width * lm.height; ++p) {
+                    uint32_t row = p / lm.width, col = p - row * lm.width;
+                    dst[lm.offset + p] = (uint32_t) i * slice + row * atlas_w + col;
+                    scl[lm.offset + p] = inv_area;
+                }
+            }
+            auto up_u = [](const std::vector<uint32_t> &v) {
+                return dr::load<DynamicBuffer<UInt32>>(v.data(), v.size());
+            };
+            auto up_f = [](const std::vector<ScalarFloat> &v) {
+                return dr::load<DynamicBuffer<Float>>(v.data(), v.size());
+            };
+            t_off = up_u(off);   t_w = up_u(w);       t_h = up_u(h);
+            t_has_uv = up_u(hu); t_ax0 = up_u(a0);    t_ax1 = up_u(a1);
+            t_org0 = up_f(o0);   t_org1 = up_f(o1);
+            t_inv0 = up_f(i0);   t_inv1 = up_f(i1);
+            d_dst = up_u(dst);   d_scale = up_f(scl);
+            data = dr::zeros<DynamicBuffer<Float>>(total_pixels);
+        }
+
+        /// Receiver index of the hit shape, plus a mask saying it IS a receiver.
+        /// A select chain, not scatters — this all stays inside one kernel.
+        std::pair<UInt32, Mask> receiver_index(const SurfaceInteraction3f &si,
+                                               const Mask &active) const {
+            UInt32 ri = dr::zeros<UInt32>();
+            Mask any = false;
+            for (size_t i = 0; i < lightmaps.size(); ++i) {
+                Mask on = active && (si.shape == ShapePtr(lightmaps[i].shape));
+                ri  = dr::select(on, UInt32((uint32_t) i), ri);
+                any |= on;
+            }
+            return { ri, any };
         }
 
         // Returns the world-position component along axis 0, 1, or 2.
@@ -178,14 +293,23 @@ public:
         // without texcoords we project world position onto the two non-normal
         // axes — note this makes uv a function of si.p, so an si.p attached to the
         // emitter ray yields an attached uv (the hook for position/tilt grads).
-        Point2f uv_for(const SurfaceInteraction3f &si, size_t i) const {
-            if (lightmaps[i].has_uv)
-                return si.uv;
-            Float u = (world_component(si, lightmaps[i].uv_axis0)
-                       - lightmaps[i].uv_origin0) * lightmaps[i].uv_inv_size0;
-            Float v = (world_component(si, lightmaps[i].uv_axis1)
-                       - lightmaps[i].uv_origin1) * lightmaps[i].uv_inv_size1;
-            return Point2f(u, v);
+        Point2f uv_for(const SurfaceInteraction3f &si, const UInt32 &ri,
+                       const Mask &active) const {
+            Mask   hu = dr::neq(dr::gather<UInt32>(t_has_uv, ri, active), 0u);
+            UInt32 a0 = dr::gather<UInt32>(t_ax0, ri, active),
+                   a1 = dr::gather<UInt32>(t_ax1, ri, active);
+            // si.p stays attached through the selects, so an si.p attached to the
+            // emitter ray still yields an attached uv (the geometry-gradient hook).
+            auto comp = [&](const UInt32 &ax) {
+                return dr::select(dr::eq(ax, 0u), si.p.x(),
+                       dr::select(dr::eq(ax, 1u), si.p.y(), si.p.z()));
+            };
+            Float u = (comp(a0) - dr::gather<Float>(t_org0, ri, active))
+                      * dr::gather<Float>(t_inv0, ri, active);
+            Float v = (comp(a1) - dr::gather<Float>(t_org1, ri, active))
+                      * dr::gather<Float>(t_inv1, ri, active);
+            return Point2f(dr::select(hu, si.uv.x(), u),
+                           dr::select(hu, si.uv.y(), v));
         }
 
         // Bilinear splat of scalar lux into the lightmap `data` (forward primal).
@@ -199,30 +323,32 @@ public:
         // this is energy-conserving except for taps that fall off the map edge
         // (masked out).
         void put(const SurfaceInteraction3f &si, const Spectrum &value, const Mask &active) {
+            if (lightmaps.empty())
+                return;
             Float lum = luminance(unpolarized_spectrum(value), si.wavelengths, active);
-            for (size_t i = 0; i < lightmaps.size(); ++i) {
-                Mask on_this = active && (si.shape == ShapePtr(lightmaps[i].shape));
+            auto [ri, hit] = receiver_index(si, active);
 
-                int Wp = (int) lightmaps[i].width, Hp = (int) lightmaps[i].height;
-                Point2f uv = uv_for(si, i);
+            Int32  Wp  = Int32(dr::gather<UInt32>(t_w, ri, hit)),
+                   Hp  = Int32(dr::gather<UInt32>(t_h, ri, hit));
+            UInt32 off = dr::gather<UInt32>(t_off, ri, hit);
+            Point2f uv = uv_for(si, ri, hit);
 
-                // Continuous pixel coordinate (pixel centers at integer + 0.5).
-                Float fx = uv.x() * float(Wp) - 0.5f,
-                      fy = uv.y() * float(Hp) - 0.5f;
-                Float x0f = dr::floor(fx), y0f = dr::floor(fy);
-                Float wx1 = fx - x0f, wy1 = fy - y0f;   // fractional part
-                Float wx0 = 1.f - wx1, wy0 = 1.f - wy1;
-                Int32 x0 = Int32(x0f), y0 = Int32(y0f);
+            // Continuous pixel coordinate (pixel centers at integer + 0.5).
+            Float fx = uv.x() * Float(Wp) - 0.5f,
+                  fy = uv.y() * Float(Hp) - 0.5f;
+            Float x0f = dr::floor(fx), y0f = dr::floor(fy);
+            Float wx1 = fx - x0f, wy1 = fy - y0f;   // fractional part
+            Float wx0 = 1.f - wx1, wy0 = 1.f - wy1;
+            Int32 x0 = Int32(x0f), y0 = Int32(y0f);
 
-                for (int t = 0; t < 4; ++t) {
-                    Int32 xx = x0 + (t & 1), yy = y0 + (t >> 1);
-                    Float w  = ((t & 1) ? wx1 : wx0) * ((t >> 1) ? wy1 : wy0);
-                    Mask in_bounds = (xx >= 0) && (xx < Wp) && (yy >= 0) && (yy < Hp);
-                    Int32 cx = dr::maximum(dr::minimum(xx, Wp - 1), 0);
-                    Int32 cy = dr::maximum(dr::minimum(yy, Hp - 1), 0);
-                    UInt32 idx = UInt32(cy * Wp + cx);
-                    dr::scatter_add(lightmaps[i].data, w * lum, idx, on_this && in_bounds);
-                }
+            for (int t = 0; t < 4; ++t) {
+                Int32 xx = x0 + (t & 1), yy = y0 + (t >> 1);
+                Float w  = ((t & 1) ? wx1 : wx0) * ((t >> 1) ? wy1 : wy0);
+                Mask in_bounds = hit && (xx >= 0) && (xx < Wp) && (yy >= 0) && (yy < Hp);
+                Int32 cx = dr::maximum(dr::minimum(xx, Wp - 1), 0);
+                Int32 cy = dr::maximum(dr::minimum(yy, Hp - 1), 0);
+                UInt32 idx = off + UInt32(cy * Wp + cx);
+                dr::scatter_add(data, w * lum, idx, in_bounds);
             }
         }
 
@@ -236,30 +362,32 @@ public:
         // biased estimate of the wrong quantity. The floor is detached so only
         // the fractional weights (not the integer cell choice) carry gradient.
         Float gather(const SurfaceInteraction3f &si, const Mask &active) const {
+            if (lightmaps.empty())
+                return 0.f;
             Float result = 0.f;
-            for (size_t i = 0; i < lightmaps.size(); ++i) {
-                Mask on_this = active && (si.shape == ShapePtr(lightmaps[i].shape));
+            auto [ri, hit] = receiver_index(si, active);
 
-                int Wp = (int) lightmaps[i].width, Hp = (int) lightmaps[i].height;
-                Point2f uv = uv_for(si, i);
+            Int32  Wp  = Int32(dr::gather<UInt32>(t_w, ri, hit)),
+                   Hp  = Int32(dr::gather<UInt32>(t_h, ri, hit));
+            UInt32 off = dr::gather<UInt32>(t_off, ri, hit);
+            Point2f uv = uv_for(si, ri, hit);
 
-                Float fx = uv.x() * float(Wp) - 0.5f,
-                      fy = uv.y() * float(Hp) - 0.5f;
-                Float x0f = dr::detach(dr::floor(fx)), y0f = dr::detach(dr::floor(fy));
-                Float wx1 = fx - x0f, wy1 = fy - y0f;
-                Float wx0 = 1.f - wx1, wy0 = 1.f - wy1;
-                Int32 x0 = Int32(x0f), y0 = Int32(y0f);
+            Float fx = uv.x() * Float(Wp) - 0.5f,
+                  fy = uv.y() * Float(Hp) - 0.5f;
+            Float x0f = dr::detach(dr::floor(fx)), y0f = dr::detach(dr::floor(fy));
+            Float wx1 = fx - x0f, wy1 = fy - y0f;
+            Float wx0 = 1.f - wx1, wy0 = 1.f - wy1;
+            Int32 x0 = Int32(x0f), y0 = Int32(y0f);
 
-                for (int t = 0; t < 4; ++t) {
-                    Int32 xx = x0 + (t & 1), yy = y0 + (t >> 1);
-                    Float w  = ((t & 1) ? wx1 : wx0) * ((t >> 1) ? wy1 : wy0);
-                    Mask in_bounds = (xx >= 0) && (xx < Wp) && (yy >= 0) && (yy < Hp);
-                    Int32 cx = dr::maximum(dr::minimum(xx, Wp - 1), 0);
-                    Int32 cy = dr::maximum(dr::minimum(yy, Hp - 1), 0);
-                    UInt32 idx = UInt32(cy * Wp + cx);
-                    Float d = dr::gather<Float>(lightmaps[i].adjoint, idx, on_this && in_bounds);
-                    result += w * d;
-                }
+            for (int t = 0; t < 4; ++t) {
+                Int32 xx = x0 + (t & 1), yy = y0 + (t >> 1);
+                Float w  = ((t & 1) ? wx1 : wx0) * ((t >> 1) ? wy1 : wy0);
+                Mask in_bounds = hit && (xx >= 0) && (xx < Wp) && (yy >= 0) && (yy < Hp);
+                Int32 cx = dr::maximum(dr::minimum(xx, Wp - 1), 0);
+                Int32 cy = dr::maximum(dr::minimum(yy, Hp - 1), 0);
+                UInt32 idx = off + UInt32(cy * Wp + cx);
+                Float d = dr::gather<Float>(adjoint, idx, in_bounds);
+                result += w * d;
             }
             return result;
         }
@@ -283,28 +411,18 @@ public:
             // left at zero; Python crops each slice to that shape's
             // receiver_resolution() (which is bound, unlike our custom methods).
             size_t   N = lightmaps.size();
-            uint32_t H = 0, W = 0;
-            for (auto &lm : lightmaps) {
-                H = std::max(H, lm.height);
-                W = std::max(W, lm.width);
-            }
-            uint32_t pixels = H * W;
+            uint32_t H = atlas_h, W = atlas_w;
 
             // zeros(), not empty(): the padding must read as unlit, not garbage.
             DynamicBuffer<Float> atlas =
-                dr::zeros<DynamicBuffer<Float>>(N * pixels);
+                dr::zeros<DynamicBuffer<Float>>(N * H * W);
 
-            // Normalize accumulated flux by texel area to get irradiance (lux).
+            // Normalize accumulated flux by texel area to get irradiance (lux),
+            // and route every pixel to its atlas slot — ONE scatter for the whole
+            // scene, using the flat-pixel tables built in build_tables().
             // texel_area is computed in prepare() from the UV-space area, NOT as
             // surface_area/(W*H) — see the Lightmap::texel_area comment.
-            for (uint32_t i = 0; i < (uint32_t) N; ++i) {
-                ScalarFloat inv_pixel_area = 1.f / lightmaps[i].texel_area;
-                uint32_t lw = lightmaps[i].width, lh = lightmaps[i].height;
-                UInt32 p   = dr::arange<UInt32>(lw * lh);
-                UInt32 row = p / lw, col = p - row * lw;
-                UInt32 dst = i * pixels + row * W + col;
-                dr::scatter(atlas, lightmaps[i].data * inv_pixel_area, dst);
-            }
+            dr::scatter(atlas, data * d_scale, d_dst);
 
             size_t shape[3] = { N, (size_t) H, (size_t) W };
             return TensorXf(std::move(atlas), 3, shape);
@@ -374,10 +492,7 @@ public:
         // atlas with no warning. Keep the product in 64 bits and clamp.
         uint64_t total_samples = requested;
         if (m_sample_mode == "per_pixel") {
-            uint64_t total_pixels = 0;
-            for (auto &lm : m_receiver.lightmaps)
-                total_pixels += (uint64_t) lm.width * lm.height;
-            total_samples = (uint64_t) requested * total_pixels;
+            total_samples = (uint64_t) requested * m_receiver.total_pixels;
         }
         if (total_samples == 0)
             Throw("ltracer: resolved sample count is zero (requested=%u, mode=%s)",
@@ -404,8 +519,7 @@ public:
             sample(scene, nullptr, sampler.get(), nullptr, scale);
 
             // Flush pending Dr.JIT kernels and keep memory bounded per pass.
-            for (auto &lm : m_receiver.lightmaps)
-                dr::eval(lm.data);
+            dr::eval(m_receiver.data);
 
             samples_done += wavefront_size;
         }
@@ -463,10 +577,7 @@ public:
             requested = (m_sample_mode == "per_pixel") ? 64u : (1u << 20);
         uint32_t total_samples = requested;
         if (m_sample_mode == "per_pixel") {
-            uint32_t total_pixels = 0;
-            for (auto &lm : m_receiver.lightmaps)
-                total_pixels += lm.width * lm.height;
-            total_samples = requested * total_pixels;
+            total_samples = requested * m_receiver.total_pixels;
         }
         ScalarFloat scale = 1.f / ScalarFloat(total_samples);
 
@@ -484,24 +595,20 @@ public:
         {
             dr::suspend_grad<Float> no_grad;
             sample(scene, nullptr, sampler.get(), nullptr, scale);
-            for (auto &lm : m_receiver.lightmaps)
-                dr::eval(lm.data);
+            dr::eval(m_receiver.data);
         }
 
         // ---- Step 2: adjoint of develop() → δ ----------------------------------
         // Make each lightmap a differentiable leaf, record only develop(), then
         // back-propagate grad_in through it. δ_i = ∂L/∂data[i] lands per surface.
-        for (auto &lm : m_receiver.lightmaps)
-            dr::enable_grad(lm.data);
+        dr::enable_grad(m_receiver.data);
 
         TensorXf atlas = m_receiver.develop();
         dr::backward_from((atlas * grad_in).array());
 
-        for (auto &lm : m_receiver.lightmaps) {
-            lm.adjoint = dr::grad(lm.data);   // the "adjoint lightmap"
-            dr::eval(lm.adjoint);
-            dr::disable_grad(lm.data);        // detach again; Step 2 graph is done
-        }
+        m_receiver.adjoint = dr::grad(m_receiver.data);   // the adjoint lightmaps
+        dr::eval(m_receiver.adjoint);
+        dr::disable_grad(m_receiver.data);   // detach again; Step 2 graph is done
 
         // ---- Pass 2: attached replay (one bounce) ------------------------------
         adjoint_pass(scene, sampler_replay.get(), scale);
