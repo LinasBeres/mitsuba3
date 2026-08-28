@@ -45,6 +45,13 @@ IES photometric light source (:monosp:`ies`)
      real fixture does when its mount is rotated. (Default: 0)
    - |exposed|, |differentiable|
 
+ * - offset
+   - |point|
+   - Differentiable displacement added to the fixture's world position. Kept
+     separate from `to_world` (which stays non-differentiable) so that sliding a
+     luminaire along a track is a first-class design variable. (Default: 0,0,0)
+   - |exposed|, |differentiable|
+
  * - to_world
    - |transform|
    - Emitter-to-world transform. In local space the luminaire sits at the origin
@@ -79,12 +86,15 @@ public:
         m_scale        = props.get<ScalarFloat>("scale", 1.f);
         m_aim_tilt     = props.get<ScalarFloat>("aim_tilt", 0.f);
         m_aim_azimuth  = props.get<ScalarFloat>("aim_azimuth", 0.f);
+        ScalarPoint3f off = props.get<ScalarPoint3f>("offset",
+                                                     ScalarPoint3f(0.f));
+        m_offset = Point3f(off.x(), off.y(), off.z());
 
         fs::path file_path = Thread::thread()->file_resolver()->resolve(
             props.get<std::string>("filename"));
         parse_ies(file_path);
 
-        dr::make_opaque(m_scale, m_aim_tilt, m_aim_azimuth);
+        dr::make_opaque(m_scale, m_aim_tilt, m_aim_azimuth, m_offset);
     }
 
     // ── LM-63 parser ────────────────────────────────────────────────────────
@@ -294,11 +304,20 @@ public:
                        -w.x() * st + w.z() * ct);
     }
 
+    /// World position: the (non-differentiable) transform plus a DIFFERENTIABLE
+    /// offset. Sliding a fixture along a track is then a design variable, and its
+    /// derivative flows through the ray ORIGIN -> first-hit point -> the bilinear
+    /// splat, exactly as the aim derivative flows through the ray direction.
+    Point3f position() const {
+        return m_to_world.value().translation() + m_offset;
+    }
+
     void traverse(TraversalCallback *cb) override {
         Base::traverse(cb);
         cb->put("scale",       m_scale,       ParamFlags::Differentiable);
         cb->put("aim_tilt",    m_aim_tilt,    ParamFlags::Differentiable);
         cb->put("aim_azimuth", m_aim_azimuth, ParamFlags::Differentiable);
+        cb->put("offset",      m_offset,      ParamFlags::Differentiable);
         cb->put("to_world",    m_to_world,    ParamFlags::NonDifferentiable);
     }
 
@@ -324,7 +343,7 @@ public:
 
         auto si = dr::zeros<SurfaceInteraction3f>();
         si.time = time;
-        si.p    = m_to_world.value().translation();
+        si.p    = position();
         auto [wavelengths, spec_weight] =
             sample_wavelengths(si, wavelength_sample, active);
 
@@ -345,7 +364,7 @@ public:
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleDirection, active);
 
         DirectionSample3f ds;
-        ds.p       = m_to_world.value().translation();
+        ds.p       = position();
         ds.n       = 0.f;
         ds.uv      = 0.f;
         ds.pdf     = 1.f;
@@ -385,7 +404,7 @@ public:
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointSamplePosition, active);
         Vector3f dir = m_to_world.value() *
                        aim_rotate(Vector3f(0.f, 0.f, -1.f));
-        PositionSample3f ps(m_to_world.value().translation(), dir,
+        PositionSample3f ps(position(), dir,
                             Point2f(0.5f), time, 1.f, true);
         return { ps, Float(1.f) };
     }
@@ -447,6 +466,7 @@ private:
     // traverse() silently does nothing.
     Float m_scale;
     Float m_aim_tilt, m_aim_azimuth;                    // degrees
+    Point3f m_offset;                                   // differentiable slide
     std::vector<ScalarFloat> m_vert, m_horiz, m_cand;   // parsed table (host)
     ScalarFloat m_theta_max, m_phi_min, m_phi_max;
     bool m_symmetric = true;
@@ -454,7 +474,8 @@ private:
     Warp m_distr;                 // importance sampling over I*sin(theta)
     FloatStorage m_inten;         // raw intensity grid (device), for the weight
 
-    MI_TRAVERSE_CB(Base, m_scale, m_aim_tilt, m_aim_azimuth, m_inten)
+    MI_TRAVERSE_CB(Base, m_scale, m_aim_tilt, m_aim_azimuth, m_offset,
+                   m_inten)
 };
 
 MI_EXPORT_PLUGIN(IESLight)
