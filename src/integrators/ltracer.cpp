@@ -344,15 +344,18 @@ public:
             for (int t = 0; t < 4; ++t) {
                 Int32 xx = x0 + (t & 1), yy = y0 + (t >> 1);
                 Float w  = ((t & 1) ? wx1 : wx0) * ((t >> 1) ? wy1 : wy0);
-                Mask in_bounds = hit && (xx >= 0) && (xx < Wp) && (yy >= 0) && (yy < Hp);
                 Int32 cx = dr::maximum(dr::minimum(xx, Wp - 1), 0);
                 Int32 cy = dr::maximum(dr::minimum(yy, Hp - 1), 0);
                 UInt32 idx = off + UInt32(cy * Wp + cx);
-                dr::scatter_add(data, w * lum, idx, in_bounds);
+                dr::scatter_add(data, w * lum, idx, hit);
             }
         }
 
         // Adjoint-transpose of put(): bilinear READ of δ at the continuous UV.
+        // Taps outside the receiver are CLAMPED to its edge, not dropped:
+        // dropping them discarded the weight and leaked energy at every
+        // receiver boundary. put() clamps identically, so the pair stays
+        // an exact transpose.
         //
         //   result = Σ_taps w_k(uv) · δ[tap_k]
         //
@@ -382,11 +385,10 @@ public:
             for (int t = 0; t < 4; ++t) {
                 Int32 xx = x0 + (t & 1), yy = y0 + (t >> 1);
                 Float w  = ((t & 1) ? wx1 : wx0) * ((t >> 1) ? wy1 : wy0);
-                Mask in_bounds = hit && (xx >= 0) && (xx < Wp) && (yy >= 0) && (yy < Hp);
                 Int32 cx = dr::maximum(dr::minimum(xx, Wp - 1), 0);
                 Int32 cy = dr::maximum(dr::minimum(yy, Hp - 1), 0);
                 UInt32 idx = off + UInt32(cy * Wp + cx);
-                Float d = dr::gather<Float>(adjoint, idx, in_bounds);
+                Float d = dr::gather<Float>(adjoint, idx, hit);
                 result += w * d;
             }
             return result;
