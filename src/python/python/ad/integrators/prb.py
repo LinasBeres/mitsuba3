@@ -169,8 +169,9 @@ class PRBIntegrator(RBIntegrator):
             active_em = active_next & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
 
             # If so, randomly sample an emitter without derivative tracking.
+            em_sample = sampler.next_2d()
             ds, em_weight = scene.sample_emitter_direction(
-                si, sampler.next_2d(), True, active_em)
+                si, em_sample, True, active_em)
             active_em &= (ds.pdf != 0.0)
 
             with dr.resume_grad(when=not primal):
@@ -182,24 +183,58 @@ class PRBIntegrator(RBIntegrator):
                     # For textured area lights, we need to track UV changes on
                     # the emitter if it is moving
                     textured_area_em = active_em & is_surface & is_spatially_varying
+
+                    # RE-INTERSECT FOR EVERY SURFACE EMITTER, not only textured
+                    # ones. `ds.p` comes back from sample_emitter_direction
+                    # DETACHED, so building the connection direction from it --
+                    # which is what the uniform-emitter branch used to do --
+                    # leaves no derivative with respect to where the emitter IS.
+                    # Moving a luminaire then produces a gradient of exactly
+                    # zero, while dimming it works, so a scene optimisation can
+                    # only ever change brightness. Re-intersecting the emitter
+                    # recovers an attached position, and the existing
+                    # solid-angle-to-area Jacobian below already accounts for
+                    # the reparameterisation.
+                    surface_em = active_em & is_surface
                     ray_em = si.spawn_ray_to(ds.p)
                     # Move ray origin closer, visibibliy is already accounted for
                     ray_em.o = dr.fma(ray_em.d, ray_em.maxt, ray_em.o)
                     ray_em.maxt = dr.largest(ray_em.maxt)
-                    si_em = scene.ray_intersect(ray_em, textured_area_em)
+                    # FollowShape: make the hit point follow the EMITTER's
+                    # geometry rather than the ray. `ray_em` is built from the
+                    # detached sample, so a plain intersection attaches to
+                    # nothing and the position derivative stays zero.
+                    si_em = scene.ray_intersect(
+                        ray_em, mi.RayFlags.All | mi.RayFlags.FollowShape,
+                        coherent=False, active=surface_em)
 
                     # Re-attach gradients for the the `ds` struct
                     ds_diff = mi.DirectionSample3f(scene, si_em, si)
-                    ds_diff = dr.select(textured_area_em, ds_diff, dr.zeros(mi.DirectionSample3f))
-                    ds_diff.d = dr.select(textured_area_em, ds_diff.d, dr.normalize(ds.p - si.p))
+                    ds_diff = dr.select(surface_em, ds_diff, dr.zeros(mi.DirectionSample3f))
+                    # DELTA emitters have no surface to re-intersect, so the
+                    # position of a point or goniometric luminaire never
+                    # reaches the graph and moving one gives no gradient at
+                    # all -- prb raises "the contribution is not attached"
+                    # outright. Re-drawing the SAME emitter sample inside this
+                    # differentiable scope recovers an attached position,
+                    # because an emitter builds it from its own parameters.
+                    ds_att, _ = scene.sample_emitter_direction(
+                        si, em_sample, True, active_em & ~is_surface)
+                    ds_diff.d = dr.select(
+                        surface_em, ds_diff.d,
+                        dr.normalize(ds_att.p - si.p))
                     ds_diff.d = dr.select(~is_infinite, ds_diff.d, ds.d)
                     ds = dr.replace_grad(ds, ds_diff)
 
-                    # If the current interaction point is moving, we need
-                    # to differentiate the solid angle to surface area
-                    # reparameterization.
+                    # If the current interaction point OR THE EMITTER is
+                    # moving, we need to differentiate the solid angle to
+                    # surface area reparameterization. `ds` is attached above,
+                    # so it is used here directly: detaching it drops the
+                    # emitter's contribution to this Jacobian and leaves the
+                    # position derivative about four times too small, with the
+                    # direction still correct.
                     J = solid_angle_to_area_jacobian(
-                        si.p, dr.detach(ds.p), dr.detach(ds.n), active_em & is_surface
+                        si.p, ds.p, ds.n, active_em & is_surface
                     )
 
                     # Given the detached emitter sample, *recompute* its
