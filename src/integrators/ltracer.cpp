@@ -743,7 +743,24 @@ public:
             // Multiplying by cos(theta_r) again gives cos^2 and breaks power
             // conservation. This is equivalent to Jensen's photon mapping formula
             // E_pixel = sum(Phi_k) / pixel_area (no extra cosine).
-            Mask on_receiver = m_receiver.is_receiver(si.shape);
+            // FRONT FACE ONLY. A receiver records illuminance on the side
+            // that faces the room, and a task plane suspended above a
+            // reflective floor also has a back. Depositing both sides into one
+            // lightmap reports light arriving underneath a desk as illuminance
+            // on the work plane: measured 6% high on a desk 0.75 m above a 0.2
+            // reflectance floor, zero at direct-only and growing with every
+            // bounce, while a floor -- which has nothing beneath it -- was
+            // unaffected. Two independent estimators (an orthographic view of
+            // the surface's own radiance, and an irradiancemeter plus the
+            // analytic direct term it cannot see) agreed with each other to
+            // 0.2% and disagreed with us by exactly that amount.
+            //
+            // This changes only what is RECORDED. The particle still scatters
+            // off the back face as before, so transport is untouched, and a
+            // closed box in which every receiver faces inward is unaffected --
+            // which is what keeps the power-conservation check valid.
+            Mask on_receiver = m_receiver.is_receiver(si.shape) &&
+                               (dr::dot(si.n, -ls.ray.d) > 0.f);
             if (dr::any_or<true>(on_receiver)) {
                 Spectrum contrib = ls.throughput * sample_scale;
                 m_receiver.put(si, contrib, ls.active && on_receiver);
