@@ -393,6 +393,35 @@ public:
         return { ds, val & active };
     }
 
+    /// Mirror of sample_direction's value, for a GIVEN direction sample.
+    ///
+    /// Needed by the attached differential path in prb and friends, which reach
+    /// the emitter through Scene::eval_emitter_direction rather than through
+    /// sample_direction. Without it a path-traced differentiable render of a
+    /// scene containing this emitter throws "Endpoint::eval_direction(): not
+    /// implemented" in the BACKWARD pass only -- the forward render is fine,
+    /// because that path does call sample_direction. The two must agree
+    /// exactly or next-event estimation is inconsistent between passes.
+    Spectrum eval_direction(const Interaction3f &it,
+                            const DirectionSample3f &ds,
+                            Mask active) const override {
+        Float inv_dist = dr::rcp(ds.dist);
+        Vector3f local_d =
+            aim_unrotate(m_to_world.value().inverse() * -ds.d);
+        auto [uv, ok] = local_to_uv(local_d);
+        active &= ok;
+
+        SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
+        si.time        = it.time;
+        si.wavelengths = it.wavelengths;
+        si.p           = ds.p;
+        auto spec = m_intensity_spec(si, active);
+
+        Float I = eval_I(uv, active);
+        return depolarizer<Spectrum>(spec) *
+               (m_scale * I * dr::square(inv_dist)) & active;
+    }
+
     Float pdf_direction(const Interaction3f &, const DirectionSample3f &,
                         Mask) const override {
         return 0.f;
